@@ -1,0 +1,83 @@
+name: Build and test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test Python and Go
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: app/requirements-dev.txt
+
+      - name: Install Python dependencies
+        run: python -m pip install -r app/requirements-dev.txt
+
+      - name: Test Python service
+        env:
+          PYTHONPATH: ${{ github.workspace }}/app
+        run: python -m pytest -q
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache-dependency-path: qqbot/go.sum
+
+      - name: Test QQ bridge
+        working-directory: qqbot
+        run: go test -race ./...
+
+      - name: Vet QQ bridge
+        working-directory: qqbot
+        run: go vet ./...
+
+      - name: Validate Compose files
+        run: |
+          cp .env.example .env
+          docker compose -f compose.yaml -f compose.gpu.yaml config --quiet
+
+  docker-build:
+    name: Build ${{ matrix.service }} image
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - service: app
+            build_args: ""
+          - service: qqbot
+            build_args: GOPROXY=https://proxy.golang.org,direct
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./${{ matrix.service }}
+          push: false
+          tags: qq-agent-${{ matrix.service }}:ci
+          build-args: ${{ matrix.build_args }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+

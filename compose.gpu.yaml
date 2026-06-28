@@ -1,0 +1,5 @@
+services:
+  embedding:
+    image: ${TEI_GPU_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:cuda-1.9}
+    gpus: all
+

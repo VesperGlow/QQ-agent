@@ -1,0 +1,103 @@
+name: memory-graph-agent
+
+services:
+  neo4j:
+    image: ${NEO4J_IMAGE:-neo4j:2026.05.0}
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:?请先在 .env 设置 NEO4J_PASSWORD}
+      HEALTHCHECK_USER: ${NEO4J_USER:-neo4j}
+      HEALTHCHECK_PASSWORD: ${NEO4J_PASSWORD}
+      NEO4J_server_memory_heap_initial__size: 512m
+      NEO4J_server_memory_heap_max__size: 1G
+      NEO4J_server_memory_pagecache_size: 512m
+      NEO4J_server_jvm_additional: --add-modules=jdk.incubator.vector
+    ports:
+      - "${NEO4J_BROWSER_BIND_IP:-127.0.0.1}:7474:7474"
+      - "${NEO4J_BROWSER_BIND_IP:-127.0.0.1}:7687:7687"
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          cypher-shell -a bolt://localhost:7687
+          -u "$${HEALTHCHECK_USER}" -p "$${HEALTHCHECK_PASSWORD}"
+          "RETURN 1" >/dev/null 2>&1
+      interval: 10s
+      timeout: 8s
+      retries: 20
+      start_period: 30s
+
+  embedding:
+    image: ${TEI_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:cpu-1.9}
+    restart: unless-stopped
+    command:
+      - --model-id
+      - ${EMBEDDING_MODEL:-Qwen/Qwen3-Embedding-0.6B}
+      - --max-batch-tokens
+      - ${EMBEDDING_CONTEXT_SIZE:-32768}
+      - --max-client-batch-size
+      - ${EMBEDDING_MAX_CLIENT_BATCH_SIZE:-16}
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+    ports:
+      - "127.0.0.1:8080:80"
+    volumes:
+      - model_cache:/data
+
+  app:
+    build:
+      context: ./app
+    restart: unless-stopped
+    env_file:
+      - .env
+    depends_on:
+      neo4j:
+        condition: service_healthy
+      embedding:
+        condition: service_started
+    ports:
+      - "${APP_BIND_IP:-127.0.0.1}:${APP_PORT:-8000}:8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/live', timeout=3)"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  qqbot:
+    build:
+      context: ./qqbot
+      args:
+        GOPROXY: ${GO_PROXY:-https://goproxy.cn,direct}
+    restart: unless-stopped
+    env_file:
+      - .env
+    depends_on:
+      app:
+        condition: service_healthy
+    ports:
+      - "${QQ_BOT_BIND_IP:-127.0.0.1}:${QQ_BOT_PORT:-9000}:9000"
+    healthcheck:
+      test:
+        - CMD
+        - wget
+        - -q
+        - -O
+        - /dev/null
+        - http://localhost:9000/healthz
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+volumes:
+  neo4j_data:
+  neo4j_logs:
+  model_cache:
