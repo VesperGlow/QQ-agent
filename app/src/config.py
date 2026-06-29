@@ -1,11 +1,27 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 from functools import lru_cache
 from typing import Any, Literal
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# 支持在 MCP 配置里用 ${NAME} 或 $NAME 引用环境变量，方便“只在 env 填 key”。
+_ENV_REF = re.compile(r"\$\{(\w+)\}|\$(\w+)")
+
+
+def _expand_env(value: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        name = match.group(1) or match.group(2)
+        resolved = os.environ.get(name)
+        if resolved is None:
+            raise ValueError(f"MCP_SERVERS_JSON 引用了未设置的环境变量 {name}")
+        return resolved
+
+    return _ENV_REF.sub(replace, value)
 
 
 def _string_list(value: Any, index: int, field_name: str) -> list[str]:
@@ -84,7 +100,7 @@ class Settings(BaseSettings):
             if not item.get("enabled", True):
                 continue
             name = str(item.get("name", "")).strip()
-            url = str(item.get("url", "")).strip()
+            url = _expand_env(str(item.get("url", "")).strip())
             if not name or not url:
                 raise ValueError(f"MCP_SERVERS_JSON[{index}] 缺少 name 或 url")
             if name in seen:
@@ -103,7 +119,7 @@ class Settings(BaseSettings):
                     "name": name,
                     "url": url,
                     "transport": transport,
-                    "headers": {str(k): str(v) for k, v in headers.items()},
+                    "headers": {str(k): _expand_env(str(v)) for k, v in headers.items()},
                     "include": include,
                     "exclude": exclude,
                 }

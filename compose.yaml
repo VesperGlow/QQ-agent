@@ -99,24 +99,6 @@ services:
       retries: 5
       start_period: 15s
 
-  # ---------- 可选：Firecrawl MCP 网页抓取工具（sidecar） ----------
-  # 取消注释后，在 .env 的 MCP_SERVERS_JSON 里加一项：
-  #   {"name":"firecrawl","url":"http://firecrawl-mcp:3000/sse","transport":"sse"}
-  # firecrawl-mcp 以 SSE 模式监听 3000 端口的 /sse。两种用法二选一：
-  #   1) 用 Firecrawl 云（含免费额度）：填 FIRECRAWL_API_KEY=fc-xxx。
-  #   2) 用自托管 Firecrawl 引擎（另行部署）：填 FIRECRAWL_API_URL=http://你的firecrawl:3002。
-  # 具体环境变量名以 firecrawl-mcp 官方文档为准。
-  # firecrawl-mcp:
-  #   image: node:22-alpine
-  #   restart: unless-stopped
-  #   command: ["npx", "-y", "firecrawl-mcp"]
-  #   environment:
-  #     SSE_LOCAL: "true"
-  #     FIRECRAWL_API_KEY: ${FIRECRAWL_API_KEY:-}
-  #     # FIRECRAWL_API_URL: ${FIRECRAWL_API_URL:-}
-  #   expose:
-  #     - "3000"
-
 volumes:
   neo4j_data:
   neo4j_logs:

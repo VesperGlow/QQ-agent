@@ -127,22 +127,21 @@ curl http://127.0.0.1:8000/v1/chat \
 主模型除了内置的记忆工具，还可以调用远程 MCP 服务器提供的工具。通过 `MCP_SERVERS_JSON`（JSON 数组）配置，每项字段：
 
 - `name`（必填）：服务器标识，工具会以 `mcp__<name>__<tool>` 暴露给模型；
-- `url`（必填）：MCP 服务器地址；
+- `url`（必填）：MCP 服务器地址，可用 `${NAME}` 引用环境变量（便于只在 env 填 key）；
 - `transport`：`streamable_http`（默认）或 `sse`；
-- `headers`：可选请求头对象；
+- `headers`：可选请求头对象，同样支持 `${NAME}`；
 - `tools` / `exclude`：工具名白名单 / 黑名单，按需挑选以节省 token；
 - `enabled`：设为 `false` 可临时停用某项。
 
-示例（Tavily 专职联网搜索、Firecrawl 专职抓网页，各取所长避免重复）：
+Tavily 与 Firecrawl 均提供托管的 streamable-http 端点，把 API key 单独放进环境变量、URL 里用 `${...}` 引用即可。下面这组只注册 Tavily 联网搜索与 Firecrawl 网页抓取，避免功能重叠浪费 token：
 
-```jsonc
-[
-  {"name":"tavily","url":"https://mcp.tavily.com/mcp/?tavilyApiKey=tvly-你的KEY","tools":["tavily_search"]},
-  {"name":"firecrawl","url":"http://firecrawl-mcp:3000/sse","transport":"sse","tools":["firecrawl_scrape","firecrawl_crawl"]}
-]
+```dotenv
+TAVILY_KEY=tvly-你的KEY
+FIRECRAWL_KEY=fc-你的完整APIKEY
+MCP_SERVERS_JSON=[{"name":"tavily","url":"https://mcp.tavily.com/mcp/?tavilyApiKey=${TAVILY_KEY}","tools":["tavily_search"]},{"name":"firecrawl","url":"https://mcp.firecrawl.dev/${FIRECRAWL_KEY}/v2/mcp","tools":["firecrawl_scrape"]}]
 ```
 
-Firecrawl 可用 `compose.yaml` 里注释好的 sidecar 运行（云免费额度填 `FIRECRAWL_API_KEY`，自托管引擎填 `FIRECRAWL_API_URL`）。`CHAT_MODEL` 需支持 OpenAI tool calling；`GET /health` 的 `mcp_tools` 字段会显示已注册的 MCP 工具数量。
+`CHAT_MODEL` 需支持 OpenAI tool calling；`GET /health` 的 `mcp_tools` 字段会显示已注册的 MCP 工具数量。
 
 ## 数据结构
 
