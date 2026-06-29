@@ -56,18 +56,15 @@ jobs:
     name: Build and publish ${{ matrix.service }}
     needs: test
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
     strategy:
       fail-fast: false
       matrix:
         include:
           - service: app
-            image: git.suzuka-chan.moe/vesperglow/qq-agent-app
+            image: git.suzuka-chan.moe/suzuka/qq-agent-app
             build_args: ""
           - service: qqbot
-            image: git.suzuka-chan.moe/vesperglow/qq-agent-qqbot
+            image: git.suzuka-chan.moe/suzuka/qq-agent-qqbot
             build_args: GOPROXY=https://proxy.golang.org,direct
     steps:
       - name: Check out repository
@@ -75,18 +72,19 @@ jobs:
 
       - name: Log in to container registry
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
-        with:
-          registry: git.suzuka-chan.moe
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "${{ secrets.FORGEJO_TOKEN }}" | docker login git.suzuka-chan.moe -u suzuka --password-stdin
 
-      - name: Build image
+      - name: Build and push image
         shell: bash
         env:
           IMAGE: ${{ matrix.image }}
           BUILD_ARGS: ${{ matrix.build_args }}
         run: |
+          set -euxo pipefail
+
+          SHORT_SHA="$(echo "$GITHUB_SHA" | cut -c1-12)"
+
           build_args=()
           while IFS= read -r build_arg; do
             [[ -n "$build_arg" ]] && build_args+=(--build-arg "$build_arg")
@@ -94,17 +92,16 @@ jobs:
 
           docker build \
             --tag "$IMAGE:latest" \
-            --tag "$IMAGE:sha-${{ github.sha }}" \
-            --label "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
-            --label "org.opencontainers.image.revision=${{ github.sha }}" \
+            --tag "$IMAGE:sha-$SHORT_SHA" \
+            --label "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
             --label "org.opencontainers.image.title=QQ Agent ${{ matrix.service }}" \
             "${build_args[@]}" \
             "./${{ matrix.service }}"
 
-      - name: Push image
-        if: github.event_name != 'pull_request'
-        env:
-          IMAGE: ${{ matrix.image }}
-        run: |
-          docker push "$IMAGE:latest"
-          docker push "$IMAGE:sha-${{ github.sha }}"
+          docker images | grep "${{ matrix.service }}" || true
+
+          if [[ "$GITHUB_EVENT_NAME" != "pull_request" ]]; then
+            docker push "$IMAGE:latest"
+            docker push "$IMAGE:sha-$SHORT_SHA"
+          fi
