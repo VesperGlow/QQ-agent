@@ -53,8 +53,12 @@ MEMORY_JUDGE_PROMPT = """你是私人助手的长期记忆筛选器。只判断�
 kind 只能是 preference、fact、goal、relationship、constraint、event、other；importance 为 1..5。
 entities 只提取对图谱真正有用的人、组织、项目、地点或产品。
 
+同时判断用户本条消息流露的情绪：仅当明确流露情绪时给出 mood，否则 mood 为 null。
+mood.label 为简短情绪词（如 平静、开心、低落、焦虑、愤怒、疲惫、孤独、兴奋）；
+mood.valence 为整数 -2..2（很负面到很正面，平静约 0）；mood.note 为不含任何隐私凭证的简短缘由。
+
 只输出 JSON 对象，不要 Markdown：
-{"should_remember":true,"memories":[{"text":"用户偏好简洁的中文回答","kind":"preference","importance":3,"entities":[]}]}"""
+{"should_remember":true,"memories":[{"text":"用户偏好简洁的中文回答","kind":"preference","importance":3,"entities":[]}],"mood":{"label":"焦虑","valence":-1,"note":"担心明天的面试"}}"""
 
 TOOLS: list[dict[str, Any]] = [
     {
@@ -183,6 +187,12 @@ class AgentResult:
     warnings: list[str] = field(default_factory=list)
 
 
+@dataclass
+class JudgeResult:
+    memories: list[dict[str, Any]]
+    mood: dict[str, Any] | None = None
+
+
 def extract_json_object(text: str) -> dict[str, Any]:
     cleaned = text.strip()
     if cleaned.startswith("```"):
@@ -229,7 +239,10 @@ class MemoryAgent:
             user_id, conversation_id, self.settings.memory_history_messages
         )
         query_vector_task = self.embedding.embed([message], is_query=True)
-        history, query_vectors = await asyncio.gather(history_task, query_vector_task)
+        mood_task = self._mood_trend(user_id)
+        history, query_vectors, mood_trend = await asyncio.gather(
+            history_task, query_vector_task, mood_task
+        )
         retrieved = await self.store.search_memories(user_id, query_vectors[0])
 
         memory_context = self._format_memory_context(retrieved)
@@ -238,6 +251,11 @@ class MemoryAgent:
             {"role": "system", "content": persona},
             {"role": "system", "content": OPERATIONAL_RULES},
             {"role": "system", "content": memory_context},
+        ]
+        mood_context = self._format_mood_context(mood_trend)
+        if mood_context:
+            messages.append({"role": "system", "content": mood_context})
+        messages += [
             *history,
             {"role": "user", "content": message},
         ]
@@ -255,10 +273,16 @@ class MemoryAgent:
             warnings.append(f"记忆筛选失败：{judged}")
         else:
             try:
-                saved = await self._save_judged_memories(user_id, judged)
+                saved = await self._save_judged_memories(user_id, judged.memories)
             except Exception as exc:
                 logger.warning("Saving judged memories failed", exc_info=exc)
                 warnings.append(f"自动保存记忆失败：{exc}")
+            if self.settings.mood_tracking_enabled and judged.mood:
+                try:
+                    await self.store.record_mood(user_id, **judged.mood)
+                except Exception as exc:
+                    logger.warning("Recording mood failed", exc_info=exc)
+                    warnings.append(f"记录情绪失败：{exc}")
 
         if isinstance(chat_result, Exception):
             raise chat_result
@@ -288,7 +312,52 @@ class MemoryAgent:
             )
         return "\n".join(lines)
 
-    async def _judge_memories(self, user_message: str) -> list[dict[str, Any]]:
+    async def _mood_trend(self, user_id: str) -> dict[str, Any]:
+        # 情绪趋势只是上下文加成，查询失败不应中断对话。
+        if not self.settings.mood_tracking_enabled:
+            return {"count": 0}
+        try:
+            return await self.store.mood_trend(user_id, self.settings.mood_trend_days)
+        except Exception as exc:
+            logger.warning("Mood trend lookup failed", exc_info=exc)
+            return {"count": 0}
+
+    @staticmethod
+    def _format_mood_context(trend: dict[str, Any]) -> str:
+        count = trend.get("count", 0) if isinstance(trend, dict) else 0
+        if not count:
+            return ""
+        avg = trend.get("avg_valence", 0.0)
+        if avg >= 0.7:
+            tone = "整体偏积极"
+        elif avg <= -0.7:
+            tone = "整体偏低落/负面"
+        else:
+            tone = "较为平稳"
+        latest = trend.get("latest_label") or "未知"
+        return (
+            f"用户近 {trend.get('days', 7)} 天的情绪{tone}"
+            f"（valence 均值 {avg:.1f}，共 {count} 条记录，最近一次：{latest}）。"
+            "请在语气与关心程度上自然体察，但不要生硬复述这些统计或提及'情绪记录'。"
+        )
+
+    @staticmethod
+    def _parse_mood(raw: Any) -> dict[str, Any] | None:
+        if not isinstance(raw, dict):
+            return None
+        label = str(raw.get("label", "")).strip()[:40]
+        if not label:
+            return None
+        try:
+            valence = min(max(int(raw.get("valence", 0)), -2), 2)
+        except (TypeError, ValueError):
+            valence = 0
+        note = str(raw.get("note", "")).strip()[:500]
+        if contains_sensitive_secret(note):
+            note = ""
+        return {"label": label, "valence": valence, "note": note}
+
+    async def _judge_memories(self, user_message: str) -> JudgeResult:
         messages = [
             {"role": "system", "content": MEMORY_JUDGE_PROMPT},
             {"role": "user", "content": user_message},
@@ -311,33 +380,33 @@ class MemoryAgent:
                 max_tokens=self.settings.memory_max_output_tokens,
             )
         data = extract_json_object(response.content)
-        if not data.get("should_remember"):
-            return []
+        mood = self._parse_mood(data.get("mood"))
         memories = data.get("memories") or []
-        if not isinstance(memories, list):
-            return []
-        allowed_kinds = {
-            "preference", "fact", "goal", "relationship", "constraint", "event", "other"
-        }
-        result = []
-        for item in memories[:5]:
-            if not isinstance(item, dict):
-                continue
-            text = str(item.get("text", "")).strip()[:50_000]
-            if not text or contains_sensitive_secret(text):
-                continue
-            kind = str(item.get("kind", "other"))
-            if kind not in allowed_kinds:
-                kind = "other"
-            try:
-                importance = min(max(int(item.get("importance", 3)), 1), 5)
-            except (TypeError, ValueError):
-                importance = 3
-            entities = item.get("entities") if isinstance(item.get("entities"), list) else []
-            result.append(
-                {"text": text, "kind": kind, "importance": importance, "entities": entities}
-            )
-        return result
+        result: list[dict[str, Any]] = []
+        if data.get("should_remember") and isinstance(memories, list):
+            allowed_kinds = {
+                "preference", "fact", "goal", "relationship", "constraint", "event", "other"
+            }
+            for item in memories[:5]:
+                if not isinstance(item, dict):
+                    continue
+                text = str(item.get("text", "")).strip()[:50_000]
+                if not text or contains_sensitive_secret(text):
+                    continue
+                kind = str(item.get("kind", "other"))
+                if kind not in allowed_kinds:
+                    kind = "other"
+                try:
+                    importance = min(max(int(item.get("importance", 3)), 1), 5)
+                except (TypeError, ValueError):
+                    importance = 3
+                entities = (
+                    item.get("entities") if isinstance(item.get("entities"), list) else []
+                )
+                result.append(
+                    {"text": text, "kind": kind, "importance": importance, "entities": entities}
+                )
+        return JudgeResult(memories=result, mood=mood)
 
     async def _save_judged_memories(
         self, user_id: str, memories: list[dict[str, Any]]

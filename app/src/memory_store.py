@@ -72,6 +72,7 @@ class MemoryStore:
             "CREATE CONSTRAINT conversation_id IF NOT EXISTS FOR (c:Conversation) REQUIRE c.id IS UNIQUE",
             "CREATE CONSTRAINT message_id IF NOT EXISTS FOR (m:Message) REQUIRE m.id IS UNIQUE",
             "CREATE CONSTRAINT entity_key IF NOT EXISTS FOR (e:Entity) REQUIRE e.key IS UNIQUE",
+            "CREATE CONSTRAINT mood_id IF NOT EXISTS FOR (m:Mood) REQUIRE m.id IS UNIQUE",
         ]
         for query in constraints:
             await self.driver.execute_query(query, database_=self.settings.neo4j_database)
@@ -518,6 +519,89 @@ class MemoryStore:
             query,
             user_id=user_id,
             memory_id=memory_id,
+            database_=self.settings.neo4j_database,
+        )
+        return [dict(record) for record in records]
+
+    async def record_mood(
+        self, user_id: str, label: str, valence: int, note: str = ""
+    ) -> dict[str, Any]:
+        """记录一条情绪，并接到上一条情绪后面形成 NEXT_MOOD 时间链。"""
+        mood_id = str(uuid.uuid4())
+        now = utc_now()
+        query = """
+        MERGE (u:User {id: $user_id})
+          ON CREATE SET u.created_at = $now
+        CREATE (m:Mood {
+          id: $mood_id, label: $label, valence: $valence, note: $note, created_at: $now
+        })
+        MERGE (u)-[:HAS_MOOD]->(m)
+        WITH u, m
+        OPTIONAL MATCH (u)-[:HAS_MOOD]->(prev:Mood)
+        WHERE prev.id <> m.id
+        WITH m, prev ORDER BY prev.created_at DESC LIMIT 1
+        FOREACH (p IN CASE WHEN prev IS NULL THEN [] ELSE [prev] END |
+          MERGE (p)-[:NEXT_MOOD]->(m))
+        RETURN m.id AS id, m.label AS label, m.valence AS valence,
+               m.note AS note, m.created_at AS created_at
+        """
+        records, _, _ = await self.driver.execute_query(
+            query,
+            user_id=user_id,
+            mood_id=mood_id,
+            label=label,
+            valence=valence,
+            note=note,
+            now=now,
+            database_=self.settings.neo4j_database,
+        )
+        return dict(records[0]) if records else {"id": mood_id}
+
+    async def mood_trend(self, user_id: str, days: int) -> dict[str, Any]:
+        """近 days 天的情绪聚合：条数、valence 均值、按时间倒序的标签序列。"""
+        query = """
+        MATCH (u:User {id: $user_id})-[:HAS_MOOD]->(m:Mood)
+        WHERE datetime(m.created_at) >= datetime($now) - duration({days: $days})
+        WITH m ORDER BY m.created_at DESC
+        RETURN count(m) AS count, avg(m.valence) AS avg_valence,
+               collect(m.label) AS labels, collect(m.created_at) AS times
+        """
+        records, _, _ = await self.driver.execute_query(
+            query,
+            user_id=user_id,
+            days=days,
+            now=utc_now(),
+            database_=self.settings.neo4j_database,
+        )
+        if not records or not records[0]["count"]:
+            return {"count": 0, "days": days}
+        row = records[0]
+        labels = list(row["labels"])
+        times = list(row["times"])
+        distribution: dict[str, int] = {}
+        for label in labels:
+            distribution[label] = distribution.get(label, 0) + 1
+        return {
+            "count": row["count"],
+            "days": days,
+            "avg_valence": float(row["avg_valence"]) if row["avg_valence"] is not None else 0.0,
+            "latest_label": labels[0] if labels else None,
+            "latest_at": times[0] if times else None,
+            "distribution": distribution,
+        }
+
+    async def recent_moods(self, user_id: str, limit: int) -> list[dict[str, Any]]:
+        query = """
+        MATCH (u:User {id: $user_id})-[:HAS_MOOD]->(m:Mood)
+        RETURN m.id AS id, m.label AS label, m.valence AS valence,
+               m.note AS note, m.created_at AS created_at
+        ORDER BY m.created_at DESC
+        LIMIT $limit
+        """
+        records, _, _ = await self.driver.execute_query(
+            query,
+            user_id=user_id,
+            limit=min(max(limit, 1), 500),
             database_=self.settings.neo4j_database,
         )
         return [dict(record) for record in records]

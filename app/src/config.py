@@ -86,6 +86,11 @@ class Settings(BaseSettings):
     memory_importance_weight: float = Field(default=0.10, ge=0)
     memory_recency_halflife_days: float = Field(default=30.0, gt=0)
 
+    # 情绪时间线：从对话抽取用户情绪、按时间成链，让助手感知跨会话趋势。
+    mood_tracking_enabled: bool = True
+    mood_trend_days: int = Field(default=7, ge=1, le=90)
+    mood_recent_limit: int = Field(default=50, ge=1, le=500)
+
     @field_validator("ai_base_url", "embedding_base_url", "neo4j_uri")
     @classmethod
     def trim_url(cls, value: str) -> str:

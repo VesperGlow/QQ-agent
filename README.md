@@ -123,6 +123,7 @@ curl http://127.0.0.1:8000/v1/chat \
 - `DELETE /v1/memories/{id}`：软删除/遗忘；
 - `GET /v1/memories/{id}/history`：沿 SUPERSEDES 链回溯一条记忆的演变时间线；
 - `POST /v1/memories/link`：建立记忆关系；
+- `GET /v1/mood/{user_id}`：情绪时间线与近期趋势聚合；
 - `GET /v1/graph/{user_id}`：导出小型图谱快照；
 - `GET /health`：检查三项依赖。
 
@@ -153,7 +154,10 @@ MCP_SERVERS_JSON=[{"name":"tavily","url":"https://mcp.tavily.com/mcp/?tavilyApiK
 - `(User)-[:HAS_MEMORY]->(Memory)` 保存长期记忆和向量；
 - `(Memory)-[:MENTIONS]->(Entity)` 形成实体图谱；
 - `(Memory)-[:RELATED_TO {kind}]->(Memory)` 保存主模型建立的记忆关系；
-- `(Memory)-[:SUPERSEDES {at}]->(Memory)` 记录记忆演变：用户情况变化时新记忆取代旧记忆，旧的软停用但保留在图里，可经 `/history` 回溯时间线。
+- `(Memory)-[:SUPERSEDES {at}]->(Memory)` 记录记忆演变：用户情况变化时新记忆取代旧记忆，旧的软停用但保留在图里，可经 `/history` 回溯时间线；
+- `(User)-[:HAS_MOOD]->(Mood)-[:NEXT_MOOD]->(Mood)` 情绪时间线：从每条消息抽取的情绪（label/valence/note）按时间成链。
+
+情绪识别折叠进"记忆筛选"那一次廉价模型调用里（不额外耗 token），仅在消息明确流露情绪时记录。每轮对话前会把近期情绪趋势压成一行注入上下文，让助手自然体察用户状态。由 `MOOD_TRACKING_ENABLED` 开关、`MOOD_TREND_DAYS` 控制回看窗口。
 
 所有记忆操作都按 `user_id` 隔离。遗忘采用软删除，节点仍可审计但不会再被检索。
 

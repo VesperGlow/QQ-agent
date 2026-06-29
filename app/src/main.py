@@ -224,6 +224,19 @@ async def link_memories(
     return {"linked": True}
 
 
+@app.get("/v1/mood/{user_id}", dependencies=[Depends(require_api_key)])
+async def mood_timeline(
+    user_id: str,
+    days: int = Query(default=7, ge=1, le=90),
+    limit: int = Query(default=50, ge=1, le=500),
+    store: MemoryStore = Depends(get_store),
+) -> dict[str, object]:
+    return {
+        "trend": await store.mood_trend(user_id, days),
+        "recent": await store.recent_moods(user_id, limit),
+    }
+
+
 @app.get("/v1/graph/{user_id}", dependencies=[Depends(require_api_key)])
 async def graph(
     user_id: str,
