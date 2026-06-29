@@ -27,8 +27,20 @@ type rawEnvelope struct {
 	} `json:"d"`
 }
 
-func registerQQHandlers(processor *Processor, cfg Config) {
-	handlers := make([]interface{}, 0, 3)
+func registerQQHandlers(processor *Processor, cfg Config) dto.Intent {
+	handlers := make([]interface{}, 0, 5)
+	handlers = append(handlers,
+		event.ReadyHandler(func(_ *dto.WSPayload, data *dto.WSReadyData) {
+			if data == nil {
+				log.Print("QQ WebSocket 已连接")
+				return
+			}
+			log.Printf("QQ WebSocket 已连接 (shard=%v)", data.Shard)
+		}),
+		event.ErrorNotifyHandler(func(err error) {
+			log.Printf("QQ WebSocket 连接异常，BotGo 将尝试恢复: %v", err)
+		}),
+	)
 	if cfg.EnableC2C {
 		handlers = append(handlers, c2cHandler(processor))
 	}
@@ -38,7 +50,7 @@ func registerQQHandlers(processor *Processor, cfg Config) {
 	if cfg.EnableChannel {
 		handlers = append(handlers, channelHandler(processor))
 	}
-	event.RegisterHandlers(handlers...)
+	return event.RegisterHandlers(handlers...)
 }
 
 func c2cHandler(processor *Processor) event.C2CMessageEventHandler {

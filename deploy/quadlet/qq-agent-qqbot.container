@@ -1,0 +1,28 @@
+[Unit]
+Description=QQ Agent BotGo WebSocket/Webhook bridge
+Requires=qq-agent-app.service
+After=qq-agent-app.service
+
+[Container]
+Image=ghcr.io/vesperglow/qq-agent-qqbot:latest
+ContainerName=qq-agent-qqbot
+Network=qq-agent.network
+EnvironmentFile=./qqbot.env
+PublishPort=127.0.0.1:9000:9000
+AutoUpdate=registry
+HealthCmd=wget -q -O /dev/null http://127.0.0.1:9000/healthz
+HealthInterval=15s
+HealthRetries=5
+HealthStartPeriod=15s
+HealthTimeout=5s
+HealthOnFailure=kill
+Notify=healthy
+
+[Service]
+Restart=always
+RestartSec=5s
+TimeoutStartSec=120
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

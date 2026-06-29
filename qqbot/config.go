@@ -8,9 +8,15 @@ import (
 	"time"
 )
 
+const (
+	EventModeWebhook   = "webhook"
+	EventModeWebSocket = "websocket"
+)
+
 type Config struct {
 	AppID           string
 	AppSecret       string
+	EventMode       string
 	ListenAddr      string
 	WebhookPath     string
 	AIURL           string
@@ -33,6 +39,7 @@ func LoadConfig() (Config, error) {
 	cfg := Config{
 		AppID:           strings.TrimSpace(os.Getenv("QQ_APP_ID")),
 		AppSecret:       strings.TrimSpace(os.Getenv("QQ_APP_SECRET")),
+		EventMode:       strings.ToLower(envString("QQ_EVENT_MODE", EventModeWebhook)),
 		ListenAddr:      envString("QQ_LISTEN_ADDR", ":9000"),
 		WebhookPath:     envString("QQ_WEBHOOK_PATH", "/qqbot"),
 		AIURL:           envString("QQ_AI_URL", "http://app:8000/v1/chat"),
@@ -52,6 +59,9 @@ func LoadConfig() (Config, error) {
 	}
 	if cfg.AppID == "" || cfg.AppSecret == "" {
 		return Config{}, fmt.Errorf("QQ_APP_ID 和 QQ_APP_SECRET 不能为空")
+	}
+	if cfg.EventMode != EventModeWebhook && cfg.EventMode != EventModeWebSocket {
+		return Config{}, fmt.Errorf("QQ_EVENT_MODE 必须是 webhook 或 websocket")
 	}
 	if !strings.HasPrefix(cfg.WebhookPath, "/") {
 		cfg.WebhookPath = "/" + cfg.WebhookPath
