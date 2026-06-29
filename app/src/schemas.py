@@ -17,6 +17,7 @@ class MemoryView(BaseModel):
     text: str
     kind: str
     importance: int
+    subject: Literal["user", "assistant"] = "user"
     score: float | None = None
     entities: list[dict[str, str]] = Field(default_factory=list)
     created_at: str | None = None
@@ -41,6 +42,7 @@ class CreateMemoryRequest(BaseModel):
     text: str = Field(min_length=1, max_length=50_000)
     kind: Literal["preference", "fact", "goal", "relationship", "constraint", "event", "other"] = "other"
     importance: int = Field(default=3, ge=1, le=5)
+    subject: Literal["user", "assistant"] = "user"
     entities: list[EntityInput] = Field(default_factory=list, max_length=30)
 
 

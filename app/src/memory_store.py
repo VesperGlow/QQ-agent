@@ -218,6 +218,7 @@ class MemoryStore:
             node.last_accessed_at = $now
         RETURN node.id AS id, node.text AS text, node.kind AS kind,
                node.importance AS importance, node.created_at AS created_at,
+               coalesce(node.subject, 'user') AS subject,
                score, [entity IN raw_entities WHERE entity.name IS NOT NULL] AS entities,
                score * $similarity_weight
                  + recency * $recency_weight
@@ -251,6 +252,7 @@ class MemoryStore:
             node.last_accessed_at = $now
         RETURN node.id AS id, node.text AS text, node.kind AS kind,
                node.importance AS importance, node.created_at AS created_at,
+               coalesce(node.subject, 'user') AS subject,
                score, [entity IN raw_entities WHERE entity.name IS NOT NULL] AS entities
         ORDER BY score DESC
         LIMIT $limit
@@ -268,6 +270,7 @@ class MemoryStore:
         WITH m, collect(DISTINCT {name: e.name, type: e.type}) AS raw_entities
         RETURN m.id AS id, m.text AS text, m.kind AS kind,
                m.importance AS importance, m.created_at AS created_at,
+               coalesce(m.subject, 'user') AS subject,
                [entity IN raw_entities WHERE entity.name IS NOT NULL] AS entities
         ORDER BY coalesce(m.last_seen_at, m.created_at) DESC
         LIMIT $limit
@@ -290,18 +293,22 @@ class MemoryStore:
         entities: list[dict[str, str]],
         embedding: list[float],
         source: str,
+        subject: str = "user",
     ) -> dict[str, Any]:
+        subject = subject if subject in {"user", "assistant"} else "user"
         text = text.strip()
         fingerprint = hashlib.sha256(text.casefold().encode("utf-8")).hexdigest()
         now = utc_now()
+        # 去重按主体隔离：同样文本但主体不同（关于用户 vs 关于助手）不应合并。
         existing_query = """
         MATCH (:User {id: $user_id})-[:HAS_MEMORY]->(m:Memory {fingerprint: $fingerprint})
-        WHERE coalesce(m.active, true) = true
+        WHERE coalesce(m.active, true) = true AND coalesce(m.subject, 'user') = $subject
         SET m.last_seen_at = $now,
             m.repetitions = coalesce(m.repetitions, 1) + 1,
             m.importance = CASE WHEN m.importance < $importance THEN $importance ELSE m.importance END
         RETURN m.id AS id, m.text AS text, m.kind AS kind,
-               m.importance AS importance, m.created_at AS created_at
+               m.importance AS importance, m.created_at AS created_at,
+               coalesce(m.subject, 'user') AS subject
         LIMIT 1
         """
         records, _, _ = await self.driver.execute_query(
@@ -310,6 +317,7 @@ class MemoryStore:
             fingerprint=fingerprint,
             importance=importance,
             now=now,
+            subject=subject,
             database_=self.settings.neo4j_database,
         )
         if records:
@@ -330,7 +338,11 @@ class MemoryStore:
             )
         except Exception:
             candidates = []
-        if candidates and candidates[0].get("kind") == kind:
+        if (
+            candidates
+            and candidates[0].get("kind") == kind
+            and candidates[0].get("subject", "user") == subject
+        ):
             candidate = candidates[0]
             update_query = """
             MATCH (:User {id: $user_id})-[:HAS_MEMORY]->(m:Memory {id: $memory_id})
@@ -338,7 +350,8 @@ class MemoryStore:
                 m.repetitions = coalesce(m.repetitions, 1) + 1,
                 m.importance = CASE WHEN m.importance < $importance THEN $importance ELSE m.importance END
             RETURN m.id AS id, m.text AS text, m.kind AS kind,
-                   m.importance AS importance, m.created_at AS created_at
+                   m.importance AS importance, m.created_at AS created_at,
+                   coalesce(m.subject, 'user') AS subject
             """
             records, _, _ = await self.driver.execute_query(
                 update_query,
@@ -374,7 +387,7 @@ class MemoryStore:
           ON CREATE SET u.created_at = $now
         CREATE (m:Memory {
           id: $memory_id, text: $text, kind: $kind, importance: $importance,
-          embedding: $embedding, fingerprint: $fingerprint, source: $source,
+          subject: $subject, embedding: $embedding, fingerprint: $fingerprint, source: $source,
           active: true, repetitions: 1, access_count: 0,
           created_at: $now, last_seen_at: $now
         })
@@ -385,7 +398,7 @@ class MemoryStore:
           ON CREATE SET e.name = entity.name, e.type = entity.type, e.created_at = $now
         MERGE (m)-[:MENTIONS]->(e)
         RETURN m.id AS id, m.text AS text, m.kind AS kind,
-               m.importance AS importance, m.created_at AS created_at
+               m.importance AS importance, m.created_at AS created_at, m.subject AS subject
         """
         if safe_entities:
             records, _, _ = await self.driver.execute_query(
@@ -395,6 +408,7 @@ class MemoryStore:
                 text=text,
                 kind=kind,
                 importance=importance,
+                subject=subject,
                 embedding=embedding,
                 fingerprint=fingerprint,
                 source=source,
@@ -409,13 +423,13 @@ class MemoryStore:
               ON CREATE SET u.created_at = $now
             CREATE (m:Memory {
               id: $memory_id, text: $text, kind: $kind, importance: $importance,
-              embedding: $embedding, fingerprint: $fingerprint, source: $source,
+              subject: $subject, embedding: $embedding, fingerprint: $fingerprint, source: $source,
               active: true, repetitions: 1, access_count: 0,
               created_at: $now, last_seen_at: $now
             })
             MERGE (u)-[:HAS_MEMORY]->(m)
             RETURN m.id AS id, m.text AS text, m.kind AS kind,
-                   m.importance AS importance, m.created_at AS created_at
+                   m.importance AS importance, m.created_at AS created_at, m.subject AS subject
             """
             records, _, _ = await self.driver.execute_query(
                 no_entity_query,
@@ -424,6 +438,7 @@ class MemoryStore:
                 text=text,
                 kind=kind,
                 importance=importance,
+                subject=subject,
                 embedding=embedding,
                 fingerprint=fingerprint,
                 source=source,
@@ -462,6 +477,7 @@ class MemoryStore:
         importance: int,
         entities: list[dict[str, str]],
         embedding: list[float],
+        subject: str = "user",
     ) -> dict[str, Any]:
         """用新内容取代一条旧记忆：新建（或复用）新记忆，建 SUPERSEDES 关系，软停用旧记忆。
 
@@ -475,6 +491,7 @@ class MemoryStore:
             entities=entities,
             embedding=embedding,
             source="memory_update",
+            subject=subject,
         )
         now = utc_now()
         link_query = """
@@ -512,6 +529,7 @@ class MemoryStore:
         WHERE node IS NOT NULL
         RETURN node.id AS id, node.text AS text, node.kind AS kind,
                node.importance AS importance, node.created_at AS created_at,
+               coalesce(node.subject, 'user') AS subject,
                coalesce(node.active, true) AS active, node.superseded_at AS superseded_at
         ORDER BY created_at
         """

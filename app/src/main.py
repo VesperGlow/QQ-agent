@@ -187,6 +187,7 @@ async def create_memory(
         entities=[entity.model_dump() for entity in body.entities],
         embedding=vector,
         source="manual_api",
+        subject=body.subject,
     )
     return MemoryView(**item)
 

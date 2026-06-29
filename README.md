@@ -161,6 +161,8 @@ MCP_SERVERS_JSON=[{"name":"tavily","url":"https://mcp.tavily.com/mcp/?tavilyApiK
 
 所有记忆操作都按 `user_id` 隔离。遗忘采用软删除，节点仍可审计但不会再被检索。
 
+每条记忆带 `subject` 区分主体：`user`（关于用户的事实/偏好，自动筛选只产出这类）与 `assistant`（助手自己对用户的承诺、约定或人设设定）。检索时按主体分组呈现给模型、互不混淆；写入会按主体隔离去重；旧数据无该字段时默认视为 `user`。
+
 检索使用 Cypher 25 的 `SEARCH` 子句做向量召回（取代已弃用的 `db.index.vector.queryNodes`，需 Neo4j 2026.02+），再在图内叠加**时序加权**：综合相似度、新近度（以 `last_seen_at` 为锚做半衰期衰减，被反复提及的记忆更"新鲜"）、重要性与访问次数排序。权重见上方 `MEMORY_*_WEIGHT`，全设 0 即退回纯相似度。返回给上层的 `score` 仍是原始余弦相似度。
 
 ## 资源建议
