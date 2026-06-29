@@ -205,4 +205,12 @@ docker compose pull
 docker compose up -d --no-build
 ```
 
+GHCR 首次发布的个人包通常是私有的。私有状态下，先创建带 `read:packages` 权限的 GitHub PAT，然后登录：
+
+```sh
+echo "$GHCR_TOKEN" | docker login ghcr.io -u VesperGlow --password-stdin
+```
+
+如需免登录拉取，请分别进入 [app 包设置](https://github.com/users/VesperGlow/packages/container/qq-agent-app/settings) 和 [qqbot 包设置](https://github.com/users/VesperGlow/packages/container/qq-agent-qqbot/settings)，将可见性改为 `Public`。
+
 本地开发仍可使用 `docker compose up -d --build`，Compose 会按 `APP_IMAGE` 和 `QQBOT_IMAGE` 给本地构建结果打标签。
