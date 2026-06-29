@@ -146,6 +146,70 @@ class MemoryStore:
             if record["role"] in {"user", "assistant"}
         ]
 
+    async def get_conversation_summary(self, user_id: str, conversation_id: str) -> str:
+        query = """
+        MATCH (:User {id: $user_id})-[:HAS_CONVERSATION]->(c:Conversation {id: $conversation_id})
+        RETURN coalesce(c.summary, '') AS summary
+        """
+        records, _, _ = await self.driver.execute_query(
+            query,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            database_=self.settings.neo4j_database,
+        )
+        return records[0]["summary"] if records else ""
+
+    async def messages_to_summarize(
+        self, user_id: str, conversation_id: str, window: int, limit: int = 200
+    ) -> dict[str, Any] | None:
+        """取已滑出短期窗口（seq <= total-window）且尚未摘要（seq > summary_upto_seq）的旧消息。"""
+        query = """
+        MATCH (:User {id: $user_id})-[:HAS_CONVERSATION]->(c:Conversation {id: $conversation_id})
+        WITH c, coalesce(c.summary, '') AS summary,
+             coalesce(c.summary_upto_seq, 0) AS upto,
+             coalesce(c.message_count, 0) AS total
+        MATCH (c)-[:HAS_MESSAGE]->(m:Message)
+        WHERE coalesce(m.seq, 0) > upto AND coalesce(m.seq, 0) <= total - $window
+          AND m.role IN ['user', 'assistant']
+        WITH summary, m ORDER BY coalesce(m.seq, 0) ASC LIMIT $limit
+        RETURN summary AS summary,
+               collect({role: m.role, content: m.content}) AS messages,
+               max(coalesce(m.seq, 0)) AS max_seq
+        """
+        records, _, _ = await self.driver.execute_query(
+            query,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            window=max(window, 0),
+            limit=min(max(limit, 1), 1000),
+            database_=self.settings.neo4j_database,
+        )
+        if not records or not records[0]["messages"]:
+            return None
+        row = records[0]
+        return {
+            "summary": row["summary"],
+            "messages": list(row["messages"]),
+            "max_seq": row["max_seq"],
+        }
+
+    async def update_conversation_summary(
+        self, user_id: str, conversation_id: str, summary: str, upto_seq: int
+    ) -> None:
+        query = """
+        MATCH (:User {id: $user_id})-[:HAS_CONVERSATION]->(c:Conversation {id: $conversation_id})
+        SET c.summary = $summary, c.summary_upto_seq = $upto_seq, c.summary_at = $now
+        """
+        await self.driver.execute_query(
+            query,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            summary=summary,
+            upto_seq=upto_seq,
+            now=utc_now(),
+            database_=self.settings.neo4j_database,
+        )
+
     async def search_memories(
         self,
         user_id: str,

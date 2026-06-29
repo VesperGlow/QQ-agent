@@ -42,6 +42,9 @@ class Settings(BaseSettings):
     # 默认人设（只写性格/口吻）。请求未带 system_prompt 时用它；留空则用内置默认人设。
     # 系统指令层（输出格式/记忆工具/安全）始终生效、与此无关。
     persona_prompt: str = ""
+    # 系统指令层。留空用内置默认（推荐）；非空则整体覆盖，需自行包含格式/安全等约束。
+    # 多行用字面量 \n 分隔（会被还原为换行），方便放进单行 env。
+    system_instructions: str = ""
 
     ai_base_url: str = ""
     ai_api_key: str = ""
@@ -81,6 +84,14 @@ class Settings(BaseSettings):
     memory_min_score: float = Field(default=0.30, ge=-1, le=1)
     memory_history_messages: int = Field(default=16, ge=0, le=100)
     memory_duplicate_threshold: float = Field(default=0.995, ge=0.8, le=1)
+    # 对纯寒暄/填充类短消息跳过记忆筛选与情绪抽取，省一次便宜模型调用。
+    memory_judge_skip_trivial: bool = True
+
+    # 滚动摘要：把滑出短期窗口的旧消息压缩进会话摘要，超长对话也能保留连续性。
+    conversation_summary_enabled: bool = True
+    # 累计这么多条"已滑出窗口且未摘要"的消息才触发一次摘要更新（用便宜模型）。
+    conversation_summary_batch: int = Field(default=10, ge=2, le=100)
+    conversation_summary_max_chars: int = Field(default=1000, ge=100, le=8000)
 
     # 时序加权检索：在向量相似度之上叠加新近度、重要性与访问强化。
     # 相似度仍是主导，其余为小幅加成；全设 0 即退回纯相似度排序。
