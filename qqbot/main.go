@@ -34,7 +34,7 @@ func main() {
 	}
 	api := botgo.NewOpenAPI(cfg.AppID, tokenSource).WithTimeout(cfg.OpenAPITimeout).SetDebug(cfg.Debug)
 	processor := NewProcessor(api, cfg)
-	intents := registerQQHandlers(processor, cfg)
+	intents := registerQQHandlers(processor)
 
 	server := newHTTPServer(cfg, credentials)
 	serverErrors := make(chan error, 1)
@@ -51,7 +51,7 @@ func main() {
 	}()
 
 	if cfg.EventMode == EventModeWebhook {
-		log.Printf("QQ Bot Webhook 已启动: %s%s (c2c=%t group=%t channel=%t)", cfg.ListenAddr, cfg.WebhookPath, cfg.EnableC2C, cfg.EnableGroup, cfg.EnableChannel)
+		log.Printf("QQ Bot Webhook 已启动: %s%s (私聊 C2C)", cfg.ListenAddr, cfg.WebhookPath)
 		select {
 		case <-ctx.Done():
 			return
@@ -60,7 +60,7 @@ func main() {
 		}
 	}
 
-	log.Printf("QQ Bot WebSocket 正在启动（健康检查: %s/healthz，c2c=%t group=%t channel=%t）", cfg.ListenAddr, cfg.EnableC2C, cfg.EnableGroup, cfg.EnableChannel)
+	log.Printf("QQ Bot WebSocket 正在启动（健康检查: %s/healthz，私聊 C2C）", cfg.ListenAddr)
 	gateway, err := api.WS(ctx, nil, "")
 	if err != nil {
 		log.Fatalf("获取 QQ WebSocket 网关失败: %v", err)

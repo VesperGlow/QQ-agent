@@ -2,10 +2,18 @@ from __future__ import annotations
 
 import json
 from functools import lru_cache
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _string_list(value: Any, index: int, field_name: str) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError(f"MCP_SERVERS_JSON[{index}] 的 {field_name} 必须是字符串数组")
+    return [str(item).strip() for item in value if str(item).strip()]
 
 
 class Settings(BaseSettings):
@@ -26,6 +34,13 @@ class Settings(BaseSettings):
     chat_max_output_tokens: int = 2048
     memory_max_output_tokens: int = 800
     max_tool_rounds: int = 6
+
+    # 远程 MCP 工具服务器。JSON 数组，每项形如：
+    # {"name":"tavily","url":"https://mcp.tavily.com/mcp/?tavilyApiKey=tvly-xxx"}
+    # 可选字段：transport（streamable_http|sse，默认 streamable_http）、headers（对象）、enabled（默认 true）。
+    mcp_servers_json: str = "[]"
+    mcp_timeout_seconds: float = 60
+    mcp_result_max_chars: int = 12000
 
     embedding_base_url: str = "http://embedding:80"
     embedding_api_key: str = ""
@@ -54,6 +69,48 @@ class Settings(BaseSettings):
         return value.strip().rstrip("/")
 
     @property
+    def mcp_servers(self) -> list[dict[str, Any]]:
+        try:
+            raw = json.loads(self.mcp_servers_json or "[]")
+        except json.JSONDecodeError as exc:
+            raise ValueError("MCP_SERVERS_JSON 必须是合法 JSON") from exc
+        if not isinstance(raw, list):
+            raise ValueError("MCP_SERVERS_JSON 必须是 JSON 数组")
+        servers: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for index, item in enumerate(raw):
+            if not isinstance(item, dict):
+                raise ValueError("MCP_SERVERS_JSON 的每一项必须是对象")
+            if not item.get("enabled", True):
+                continue
+            name = str(item.get("name", "")).strip()
+            url = str(item.get("url", "")).strip()
+            if not name or not url:
+                raise ValueError(f"MCP_SERVERS_JSON[{index}] 缺少 name 或 url")
+            if name in seen:
+                raise ValueError(f"MCP_SERVERS_JSON 出现重复的 name：{name}")
+            seen.add(name)
+            transport = str(item.get("transport", "streamable_http")).strip().lower()
+            if transport not in {"streamable_http", "sse"}:
+                raise ValueError(f"MCP_SERVERS_JSON[{index}] 的 transport 只能是 streamable_http 或 sse")
+            headers = item.get("headers") or {}
+            if not isinstance(headers, dict):
+                raise ValueError(f"MCP_SERVERS_JSON[{index}] 的 headers 必须是对象")
+            include = _string_list(item.get("tools"), index, "tools")
+            exclude = _string_list(item.get("exclude"), index, "exclude")
+            servers.append(
+                {
+                    "name": name,
+                    "url": url,
+                    "transport": transport,
+                    "headers": {str(k): str(v) for k, v in headers.items()},
+                    "include": include,
+                    "exclude": exclude,
+                }
+            )
+        return servers
+
+    @property
     def ai_extra_headers(self) -> dict[str, str]:
         try:
             raw = json.loads(self.ai_extra_headers_json or "{}")
@@ -76,6 +133,7 @@ class Settings(BaseSettings):
             "embedding_context_size": self.embedding_context_size,
             "neo4j_uri": self.neo4j_uri,
             "neo4j_database": self.neo4j_database,
+            "mcp_servers": [server["name"] for server in self.mcp_servers],
         }
 
 

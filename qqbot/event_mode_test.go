@@ -14,9 +14,6 @@ func setRequiredConfigEnv(t *testing.T) {
 	t.Setenv("QQ_APP_ID", "test-app")
 	t.Setenv("QQ_APP_SECRET", "test-secret")
 	t.Setenv("QQ_AI_URL", "http://app:8000/v1/chat")
-	t.Setenv("QQ_ENABLE_C2C", "true")
-	t.Setenv("QQ_ENABLE_GROUP", "true")
-	t.Setenv("QQ_ENABLE_CHANNEL", "true")
 }
 
 func TestLoadConfigEventMode(t *testing.T) {

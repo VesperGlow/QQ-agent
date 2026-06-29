@@ -4,4 +4,7 @@ __pycache__/
 *.py[cod]
 neo4j-data/
 model-cache/
+# Go 本地构建产物
+*.exe
+/qqbot/qqbot
 

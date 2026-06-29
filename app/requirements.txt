@@ -1,5 +1,6 @@
 fastapi>=0.115,<1
 httpx>=0.28,<1
+mcp>=1.9,<2
 neo4j>=5.28,<7
 pydantic-settings>=2.7,<3
 uvicorn[standard]>=0.34,<1

@@ -21,11 +21,9 @@ type Config struct {
 	WebhookPath     string
 	AIURL           string
 	AIAPIKey        string
+	SystemPrompt    string
 	AITimeout       time.Duration
 	OpenAPITimeout  time.Duration
-	EnableC2C       bool
-	EnableGroup     bool
-	EnableChannel   bool
 	Debug           bool
 	ReplyMaxRunes   int
 	ReplyMaxParts   int
@@ -44,11 +42,9 @@ func LoadConfig() (Config, error) {
 		WebhookPath:     envString("QQ_WEBHOOK_PATH", "/qqbot"),
 		AIURL:           envString("QQ_AI_URL", "http://app:8000/v1/chat"),
 		AIAPIKey:        strings.TrimSpace(os.Getenv("APP_API_KEY")),
+		SystemPrompt:    strings.TrimSpace(os.Getenv("QQ_SYSTEM_PROMPT")),
 		AITimeout:       time.Duration(envInt("QQ_AI_TIMEOUT_SECONDS", 180, 5, 600)) * time.Second,
 		OpenAPITimeout:  time.Duration(envInt("QQ_OPENAPI_TIMEOUT_SECONDS", 15, 5, 60)) * time.Second,
-		EnableC2C:       envBool("QQ_ENABLE_C2C", true),
-		EnableGroup:     envBool("QQ_ENABLE_GROUP", true),
-		EnableChannel:   envBool("QQ_ENABLE_CHANNEL", true),
 		Debug:           envBool("QQ_BOT_DEBUG", false),
 		ReplyMaxRunes:   envInt("QQ_REPLY_MAX_RUNES", 1800, 200, 10000),
 		ReplyMaxParts:   envInt("QQ_REPLY_MAX_PARTS", 4, 1, 5),
@@ -68,9 +64,6 @@ func LoadConfig() (Config, error) {
 	}
 	if !strings.HasPrefix(cfg.AIURL, "http://") && !strings.HasPrefix(cfg.AIURL, "https://") {
 		return Config{}, fmt.Errorf("QQ_AI_URL 必须是 http:// 或 https:// 地址")
-	}
-	if !cfg.EnableC2C && !cfg.EnableGroup && !cfg.EnableChannel {
-		return Config{}, fmt.Errorf("至少启用一种 QQ 消息事件")
 	}
 	return cfg, nil
 }

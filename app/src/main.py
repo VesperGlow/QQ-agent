@@ -11,6 +11,7 @@ from .agent import MemoryAgent
 from .config import Settings, get_settings
 from .embedding import EmbeddingClient
 from .llm import LLMClient, LLMError
+from .mcp_tools import MCPManager
 from .memory_store import MemoryStore
 from .schemas import (
     ChatRequest,
@@ -33,12 +34,16 @@ async def lifespan(app: FastAPI):
     store = MemoryStore(settings)
     embedding = EmbeddingClient(settings)
     llm = LLMClient(settings)
+    mcp = MCPManager(settings)
     await store.connect()
+    await mcp.start()
     app.state.store = store
     app.state.embedding = embedding
     app.state.llm = llm
-    app.state.agent = MemoryAgent(settings, store, embedding, llm)
+    app.state.mcp = mcp
+    app.state.agent = MemoryAgent(settings, store, embedding, llm, mcp)
     yield
+    await mcp.close()
     await llm.close()
     await embedding.close()
     await store.close()
@@ -89,11 +94,13 @@ async def health(request: Request) -> dict[str, object]:
     neo4j_ok = await request.app.state.store.ping()
     embedding_ok = await request.app.state.embedding.health()
     llm_configured = bool(settings.ai_base_url and settings.chat_model and settings.memory_model)
+    mcp_tools = len(request.app.state.mcp.openai_tools())
     return {
         "status": "ok" if neo4j_ok and embedding_ok and llm_configured else "degraded",
         "neo4j": neo4j_ok,
         "embedding": embedding_ok,
         "llm_configured": llm_configured,
+        "mcp_tools": mcp_tools,
         "config": settings.safe_summary,
     }
 

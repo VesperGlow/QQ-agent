@@ -26,8 +26,8 @@ func TestSplitMessageTruncates(t *testing.T) {
 }
 
 func TestStableIDs(t *testing.T) {
-	userA, conversationA := stableIDs(ScopeGroup, "group", "user")
-	userB, conversationB := stableIDs(ScopeGroup, "group", "user")
+	userA, conversationA := stableIDs(ScopeC2C, "user", "user")
+	userB, conversationB := stableIDs(ScopeC2C, "user", "user")
 	if userA != userB || conversationA != conversationB {
 		t.Fatal("stable IDs changed for identical input")
 	}

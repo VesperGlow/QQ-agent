@@ -16,11 +16,8 @@ import (
 
 type ScopeKind string
 
-const (
-	ScopeC2C     ScopeKind = "c2c"
-	ScopeGroup   ScopeKind = "group"
-	ScopeChannel ScopeKind = "channel"
-)
+// 本机器人定位为纯私聊情感陪伴，只保留 C2C 一种场景。
+const ScopeC2C ScopeKind = "c2c"
 
 type MessageJob struct {
 	Kind           ScopeKind
@@ -44,7 +41,7 @@ type Processor struct {
 func NewProcessor(api openapi.OpenAPI, cfg Config) *Processor {
 	p := &Processor{
 		api:     api,
-		ai:      NewAIClient(cfg.AIURL, cfg.AIAPIKey, cfg.AITimeout),
+		ai:      NewAIClient(cfg.AIURL, cfg.AIAPIKey, cfg.SystemPrompt, cfg.AITimeout),
 		cfg:     cfg,
 		jobs:    make(chan MessageJob, cfg.QueueSize),
 		deduper: NewDeduper(cfg.DedupTTL),
@@ -117,10 +114,6 @@ func (p *Processor) sendText(ctx context.Context, job MessageJob, text string) e
 		switch job.Kind {
 		case ScopeC2C:
 			_, err = p.api.PostC2CMessage(ctx, job.ReplyTarget, msg)
-		case ScopeGroup:
-			_, err = p.api.PostGroupMessage(ctx, job.ReplyTarget, msg)
-		case ScopeChannel:
-			_, err = p.api.PostMessage(ctx, job.ReplyTarget, &msg)
 		default:
 			return fmt.Errorf("未知 QQ 消息场景: %s", job.Kind)
 		}
