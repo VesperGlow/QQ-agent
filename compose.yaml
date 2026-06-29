@@ -48,6 +48,7 @@ services:
       - model_cache:/data
 
   app:
+    image: ${APP_IMAGE:-ghcr.io/vesperglow/qq-agent-app:latest}
     build:
       context: ./app
     restart: unless-stopped
@@ -72,6 +73,7 @@ services:
       start_period: 20s
 
   qqbot:
+    image: ${QQBOT_IMAGE:-ghcr.io/vesperglow/qq-agent-qqbot:latest}
     build:
       context: ./qqbot
       args:
