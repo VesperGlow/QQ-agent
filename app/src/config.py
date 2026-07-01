@@ -61,7 +61,7 @@ class Settings(BaseSettings):
     # {"name":"tavily","url":"https://mcp.tavily.com/mcp/?tavilyApiKey=tvly-xxx"}
     # 可选字段：transport（streamable_http|sse，默认 streamable_http）、headers（对象）、enabled（默认 true）。
     mcp_servers_json: str = "[]"
-    mcp_timeout_seconds: float = 60
+    mcp_timeout_seconds: float = 300
     mcp_result_max_chars: int = 12000
 
     embedding_base_url: str = "http://embedding:80"
