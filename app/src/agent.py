@@ -91,7 +91,11 @@ def format_gap(gap: timedelta) -> str:
 def format_time_context(last_message_at: str | None) -> str:
     now = _now_beijing()
     weekday = _WEEKDAY_CN[now.weekday()]
-    line = f"当前北京时间：{now.strftime('%Y-%m-%d %H:%M')}，星期{weekday}。"
+    line = (
+        f"当前准确的北京时间：{now.strftime('%Y-%m-%d %H:%M')}，星期{weekday}。"
+        "这是系统直接提供的真实时间，用户问现在几点/今天星期几/几号时直接用这个回答，"
+        "不要调用搜索或其他工具去查时间，也不要说自己查不到时间。"
+    )
     if last_message_at:
         try:
             last = datetime.fromisoformat(last_message_at).astimezone(_BEIJING_TZ)

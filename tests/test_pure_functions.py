@@ -48,8 +48,9 @@ def test_format_gap_days():
 
 def test_format_time_context_includes_beijing_time_and_weekday():
     context = format_time_context(None)
-    assert "当前北京时间" in context
+    assert "北京时间" in context
     assert "星期" in context
+    assert "不要调用搜索" in context
 
 
 def test_format_time_context_mentions_gap_when_significant():
