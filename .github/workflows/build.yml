@@ -53,22 +53,12 @@ jobs:
           docker compose -f compose.yaml -f compose.gpu.yaml config --quiet
 
   docker-build:
-    name: Build and publish ${{ matrix.service }}
+    name: Build and publish image
     needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - service: app
-            image: ghcr.io/vesperglow/qq-agent-app
-            build_args: ""
-          - service: qqbot
-            image: ghcr.io/vesperglow/qq-agent-qqbot
-            build_args: GOPROXY=https://proxy.golang.org,direct
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -87,16 +77,16 @@ jobs:
       - name: Build and publish image
         uses: docker/build-push-action@v6
         with:
-          context: ./${{ matrix.service }}
+          context: .
           platforms: linux/amd64
           push: ${{ github.event_name != 'pull_request' }}
           tags: |
-            ${{ matrix.image }}:latest
-            ${{ matrix.image }}:sha-${{ github.sha }}
+            ghcr.io/vesperglow/qq-agent:latest
+            ghcr.io/vesperglow/qq-agent:sha-${{ github.sha }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.title=QQ Agent ${{ matrix.service }}
-          build-args: ${{ matrix.build_args }}
-          cache-from: type=gha,scope=${{ matrix.service }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+            org.opencontainers.image.title=QQ Agent
+          build-args: GOPROXY=https://proxy.golang.org,direct
+          cache-from: type=gha,scope=combined
+          cache-to: type=gha,mode=max,scope=combined

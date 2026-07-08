@@ -1,7 +1,12 @@
 .env
 .git
+.github
 __pycache__
 .pytest_cache
 tests
+deploy
+scripts
+compose.yaml
+compose.gpu.yaml
 README.md
-
+app/requirements-dev.txt

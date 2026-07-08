@@ -1,0 +1,27 @@
+[Unit]
+Description=QQ Agent AI API and BotGo bridge
+
+[Container]
+Image=ghcr.io/vesperglow/qq-agent:latest
+ContainerName=qq-agent
+Network=qq-agent.network
+EnvironmentFile=./qq-agent.env
+PublishPort=127.0.0.1:8000:8000
+PublishPort=127.0.0.1:9000:9000
+AutoUpdate=registry
+HealthCmd=python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/live', timeout=3); urllib.request.urlopen('http://127.0.0.1:9000/healthz', timeout=3)"
+HealthInterval=15s
+HealthRetries=5
+HealthStartPeriod=45s
+HealthTimeout=5s
+HealthOnFailure=kill
+Notify=healthy
+
+[Service]
+Restart=always
+RestartSec=5s
+TimeoutStartSec=300
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

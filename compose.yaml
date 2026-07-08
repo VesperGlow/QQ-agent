@@ -48,9 +48,11 @@ services:
       - model_cache:/data
 
   app:
-    image: ${APP_IMAGE:-ghcr.io/vesperglow/qq-agent-app:latest}
+    image: ${APP_IMAGE:-ghcr.io/vesperglow/qq-agent:latest}
     build:
-      context: ./app
+      context: .
+      args:
+        GOPROXY: ${GO_PROXY:-https://goproxy.cn,direct}
     restart: unless-stopped
     env_file:
       - .env
@@ -61,43 +63,17 @@ services:
         condition: service_started
     ports:
       - "${APP_BIND_IP:-127.0.0.1}:${APP_PORT:-8000}:8000"
+      - "${QQ_BOT_BIND_IP:-127.0.0.1}:${QQ_BOT_PORT:-9000}:9000"
     healthcheck:
       test:
         - CMD
         - python
         - -c
-        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/live', timeout=3)"
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/live', timeout=3); urllib.request.urlopen('http://localhost:9000/healthz', timeout=3)"
       interval: 15s
       timeout: 5s
       retries: 5
-      start_period: 20s
-
-  qqbot:
-    image: ${QQBOT_IMAGE:-ghcr.io/vesperglow/qq-agent-qqbot:latest}
-    build:
-      context: ./qqbot
-      args:
-        GOPROXY: ${GO_PROXY:-https://goproxy.cn,direct}
-    restart: unless-stopped
-    env_file:
-      - .env
-    depends_on:
-      app:
-        condition: service_healthy
-    ports:
-      - "${QQ_BOT_BIND_IP:-127.0.0.1}:${QQ_BOT_PORT:-9000}:9000"
-    healthcheck:
-      test:
-        - CMD
-        - wget
-        - -q
-        - -O
-        - /dev/null
-        - http://localhost:9000/healthz
-      interval: 15s
-      timeout: 5s
-      retries: 5
-      start_period: 15s
+      start_period: 45s
 
 volumes:
   neo4j_data:

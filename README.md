@@ -2,7 +2,7 @@
 
 [![Build and test](https://github.com/VesperGlow/QQ-agent/actions/workflows/build.yml/badge.svg)](https://github.com/VesperGlow/QQ-agent/actions/workflows/build.yml)
 
-这是一个可直接容器化部署的个人情感陪伴助手：本地 `Qwen3-Embedding-0.6B` 负责向量化，Neo4j 同时保存向量、记忆节点和图谱关系；便宜模型筛选长期记忆、抽取情绪，主模型负责对话与工具调用；腾讯官方 BotGo 桥接容器负责与 QQ 私聊（C2C）通信。
+这是一个可直接容器化部署的个人情感陪伴助手：本地 `Qwen3-Embedding-0.6B` 负责向量化，Neo4j 同时保存向量、记忆节点和图谱关系；便宜模型筛选长期记忆、抽取情绪，主模型负责对话与工具调用；腾讯官方 BotGo 桥接与 AI API 同在一个容器内，负责与 QQ 私聊（C2C）通信。
 
 ```mermaid
 flowchart LR
@@ -218,7 +218,7 @@ docker compose logs --tail=200 app embedding neo4j
    QQ_EVENT_MODE=websocket
    ```
 
-3. 使用 Webhook 时设置 `QQ_EVENT_MODE=webhook`，并给 `qqbot:9000` 配置公网 HTTPS 反向代理。默认宿主机只监听 `127.0.0.1:9000`，例如 Nginx：
+3. 使用 Webhook 时设置 `QQ_EVENT_MODE=webhook`，并给 `app` 容器的 `9000` 端口配置公网 HTTPS 反向代理。默认宿主机只监听 `127.0.0.1:9000`，例如 Nginx：
 
    ```nginx
    location /qqbot {
@@ -237,7 +237,7 @@ docker compose logs --tail=200 app embedding neo4j
 
    ```sh
    curl http://127.0.0.1:9000/healthz
-   docker compose logs -f qqbot
+   docker compose logs -f app
    ```
 
 Webhook 收到事件后会立即确认，再异步调用 AI，避免慢模型触发平台重试；WebSocket 会自动维护会话、心跳和重连。两种模式共用同一套消息处理逻辑：按 `msg_id` 去重、按用户会话串行处理，并用 `msg_seq` 对长回复分片。QQ 的 OpenID 只以稳定哈希形式写入 Neo4j，不直接保存原始 OpenID。
@@ -246,11 +246,10 @@ Webhook 收到事件后会立即确认，再异步调用 AI，避免慢模型触
 
 ## GHCR 镜像
 
-`main` 分支通过测试后，GitHub Actions 会发布两个 `linux/amd64` 镜像：
+`main` 分支通过测试后，GitHub Actions 会发布一个 `linux/amd64` 镜像（AI API 与 QQ 桥接合并在同一镜像内）：
 
 ```text
-ghcr.io/vesperglow/qq-agent-app:latest
-ghcr.io/vesperglow/qq-agent-qqbot:latest
+ghcr.io/vesperglow/qq-agent:latest
 ```
 
 每次发布也会生成 `sha-<完整提交号>` 标签，生产环境可以锁定该标签，避免 `latest` 变化。
@@ -270,6 +269,6 @@ GHCR 首次发布的个人包通常是私有的。私有状态下，先创建带
 echo "$GHCR_TOKEN" | docker login ghcr.io -u VesperGlow --password-stdin
 ```
 
-如需免登录拉取，请分别进入 [app 包设置](https://github.com/users/VesperGlow/packages/container/qq-agent-app/settings) 和 [qqbot 包设置](https://github.com/users/VesperGlow/packages/container/qq-agent-qqbot/settings)，将可见性改为 `Public`。
+如需免登录拉取，请进入 [qq-agent 包设置](https://github.com/users/VesperGlow/packages/container/qq-agent/settings)，将可见性改为 `Public`。
 
-本地开发仍可使用 `docker compose up -d --build`，Compose 会按 `APP_IMAGE` 和 `QQBOT_IMAGE` 给本地构建结果打标签。
+本地开发仍可使用 `docker compose up -d --build`，Compose 会按 `APP_IMAGE` 给本地构建结果打标签。
