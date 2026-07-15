@@ -64,21 +64,25 @@ class Settings(BaseSettings):
     mcp_timeout_seconds: float = 300
     mcp_result_max_chars: int = 12000
 
-    embedding_base_url: str = "http://127.0.0.1:8080"
+    # SQLite 数据库文件；所有对话、记忆、情绪都在这一个文件里。
+    db_path: str = "/data/memory.db"
+
+    # local：进程内 ONNX 推理（默认，零外部依赖）；openai：远程 OpenAI-compatible 接口。
+    embedding_api_style: Literal["local", "openai"] = "local"
+    embedding_model: str = "electroglyph/Qwen3-Embedding-0.6B-onnx-uint8"
+    embedding_base_url: str = ""
     embedding_api_key: str = ""
-    embedding_api_style: Literal["tei", "openai"] = "tei"
-    embedding_model: str = "Qwen/Qwen3-Embedding-0.6B"
     embedding_dimensions: int = Field(default=1024, ge=32, le=4096)
-    embedding_context_size: int = Field(default=32768, ge=128, le=131072)
+    # 单条输入的最大 token 数。记忆和聊天消息都很短，压低上限即压低推理峰值内存。
+    embedding_context_size: int = Field(default=2048, ge=64, le=32768)
     embedding_query_instruction: str = (
         "Given a user's message, retrieve memories that are useful for personalizing the response"
     )
     embedding_timeout_seconds: float = 180
-
-    neo4j_uri: str = "bolt://127.0.0.1:7687"
-    neo4j_user: str = "neo4j"
-    neo4j_password: str = ""
-    neo4j_database: str = "neo4j"
+    embedding_threads: int = Field(default=4, ge=1, le=32)
+    # uint8 量化输出的还原区间（electroglyph 量化版模型卡给出的标定值）。
+    embedding_output_min: float = -0.3009
+    embedding_output_max: float = 0.3952
 
     memory_search_limit: int = Field(default=8, ge=1, le=50)
     memory_min_score: float = Field(default=0.30, ge=-1, le=1)
@@ -93,12 +97,17 @@ class Settings(BaseSettings):
     conversation_summary_batch: int = Field(default=10, ge=2, le=100)
     conversation_summary_max_chars: int = Field(default=1000, ge=100, le=8000)
 
-    # 时序加权检索：在向量相似度之上叠加新近度、重要性与访问强化。
+    # 时序加权检索：在向量相似度之上叠加新近度、记忆等级与关键词命中。
     # 相似度仍是主导，其余为小幅加成；全设 0 即退回纯相似度排序。
     memory_similarity_weight: float = Field(default=1.0, ge=0)
     memory_recency_weight: float = Field(default=0.15, ge=0)
     memory_importance_weight: float = Field(default=0.10, ge=0)
+    memory_keyword_weight: float = Field(default=0.08, ge=0)
     memory_recency_halflife_days: float = Field(default=30.0, gt=0)
+
+    # 记忆等级 1..9 的保留天数梯度（逗号分隔 9 个数字）；等级 10 永久。
+    # 记忆每次被再次提及都会以当下时间续期，常被提起的记忆自然活得久。
+    memory_level_ttl_days: str = "2,4,7,14,30,60,120,240,365"
 
     # 情绪时间线：从对话抽取用户情绪、按时间成链，让助手感知跨会话趋势。
     mood_tracking_enabled: bool = True
@@ -108,10 +117,20 @@ class Settings(BaseSettings):
     # 时间感知：每轮注入当前北京时间及与上一条消息的间隔，让助手能自然问候/衔接语气。
     time_awareness_enabled: bool = True
 
-    @field_validator("ai_base_url", "embedding_base_url", "neo4j_uri")
+    @field_validator("ai_base_url", "embedding_base_url")
     @classmethod
     def trim_url(cls, value: str) -> str:
         return value.strip().rstrip("/")
+
+    @property
+    def memory_level_ttls(self) -> list[float]:
+        try:
+            values = [float(part) for part in self.memory_level_ttl_days.split(",")]
+        except ValueError as exc:
+            raise ValueError("MEMORY_LEVEL_TTL_DAYS 必须是逗号分隔的数字") from exc
+        if len(values) != 9 or any(v <= 0 for v in values):
+            raise ValueError("MEMORY_LEVEL_TTL_DAYS 需要恰好 9 个正数（等级 1..9）")
+        return values
 
     @property
     def mcp_servers(self) -> list[dict[str, Any]]:
@@ -171,13 +190,12 @@ class Settings(BaseSettings):
             "ai_base_url": self.ai_base_url,
             "memory_model": self.memory_model,
             "chat_model": self.chat_model,
-            "embedding_base_url": self.embedding_base_url,
             "embedding_api_style": self.embedding_api_style,
             "embedding_model": self.embedding_model,
             "embedding_dimensions": self.embedding_dimensions,
             "embedding_context_size": self.embedding_context_size,
-            "neo4j_uri": self.neo4j_uri,
-            "neo4j_database": self.neo4j_database,
+            "db_path": self.db_path,
+            "memory_level_ttl_days": self.memory_level_ttl_days,
             "mcp_servers": [server["name"] for server in self.mcp_servers],
         }
 

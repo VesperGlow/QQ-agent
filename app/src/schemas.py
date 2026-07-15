@@ -16,7 +16,8 @@ class MemoryView(BaseModel):
     id: str
     text: str
     kind: str
-    importance: int
+    # 记忆等级 1..10：决定保留时长，10 为永久。
+    level: int
     subject: Literal["user", "assistant"] = "user"
     score: float | None = None
     entities: list[dict[str, str]] = Field(default_factory=list)
@@ -41,7 +42,7 @@ class CreateMemoryRequest(BaseModel):
     user_id: str = Field(min_length=1, max_length=128)
     text: str = Field(min_length=1, max_length=50_000)
     kind: Literal["preference", "fact", "goal", "relationship", "constraint", "event", "other"] = "other"
-    importance: int = Field(default=3, ge=1, le=5)
+    level: int = Field(default=5, ge=1, le=10)
     subject: Literal["user", "assistant"] = "user"
     entities: list[EntityInput] = Field(default_factory=list, max_length=30)
 

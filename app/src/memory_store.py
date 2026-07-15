@@ -4,15 +4,20 @@ import asyncio
 import hashlib
 import logging
 import re
+import sqlite3
+import threading
 import uuid
-from datetime import UTC, datetime
-from typing import Any
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any, Callable, TypeVar
 
-from neo4j import AsyncGraphDatabase
+import numpy as np
 
 from .config import Settings
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 
 def utc_now() -> str:
@@ -20,211 +25,324 @@ def utc_now() -> str:
 
 
 def clean_relation(value: str) -> str:
-    cleaned = re.sub(r"[^\w\-\u4e00-\u9fff]", "_", value.strip().lower())
+    cleaned = re.sub(r"[^\w\-一-鿿]", "_", value.strip().lower())
     return cleaned[:80] or "related"
 
 
-def _strip_internal(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    # final_score is only for ordering; it never reaches the public schema (MemoryView keeps score).
-    return [{k: v for k, v in record.items() if k != "final_score"} for record in records]
+def level_expiry(level: int, ttl_days: list[float], now: str | None = None) -> str | None:
+    """按记忆等级计算过期时间。等级 10 永久（返回 None）；1..9 按 ttl_days 梯度。
+
+    记忆被再次提及时应以当下时间重算，相当于续期：反复出现的记忆越活越久。
+    """
+    if level >= 10:
+        return None
+    index = min(max(level, 1), len(ttl_days)) - 1
+    base = datetime.fromisoformat(now) if now else datetime.now(UTC)
+    return (base + timedelta(days=ttl_days[index])).isoformat()
+
+
+def _keyword_tokens(query: str, max_tokens: int = 8) -> list[str]:
+    """从查询里取值得做字面匹配的词：连续 CJK 段或 3+ 字符的字母数字词。"""
+    tokens = re.findall(r"[一-鿿]{2,}|[A-Za-z0-9_]{3,}", query)
+    seen: list[str] = []
+    for token in tokens:
+        if token not in seen:
+            seen.append(token)
+        if len(seen) >= max_tokens:
+            break
+    return seen
+
+
+def _vec_to_blob(vector: list[float]) -> bytes:
+    return np.asarray(vector, dtype=np.float16).tobytes()
+
+
+def _blob_to_vec(blob: bytes) -> np.ndarray:
+    return np.frombuffer(blob, dtype=np.float16).astype(np.float32)
+
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+  id TEXT PRIMARY KEY,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS conversations (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  message_count INTEGER NOT NULL DEFAULT 0,
+  summary TEXT NOT NULL DEFAULT '',
+  summary_upto_seq INTEGER NOT NULL DEFAULT 0,
+  summary_at TEXT
+);
+CREATE TABLE IF NOT EXISTS messages (
+  id TEXT PRIMARY KEY,
+  conversation_id TEXT NOT NULL REFERENCES conversations(id),
+  seq INTEGER NOT NULL,
+  role TEXT NOT NULL,
+  content TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE (conversation_id, seq)
+);
+CREATE TABLE IF NOT EXISTS memories (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id),
+  text TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  level INTEGER NOT NULL,
+  subject TEXT NOT NULL DEFAULT 'user',
+  embedding BLOB NOT NULL,
+  fingerprint TEXT NOT NULL,
+  source TEXT NOT NULL,
+  active INTEGER NOT NULL DEFAULT 1,
+  repetitions INTEGER NOT NULL DEFAULT 1,
+  access_count INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL,
+  last_accessed_at TEXT,
+  expires_at TEXT,
+  forgotten_at TEXT,
+  superseded_by TEXT,
+  superseded_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_memories_user ON memories(user_id, active);
+CREATE INDEX IF NOT EXISTS idx_memories_fingerprint ON memories(user_id, fingerprint);
+CREATE INDEX IF NOT EXISTS idx_memories_expires ON memories(expires_at);
+CREATE INDEX IF NOT EXISTS idx_memories_superseded_by ON memories(superseded_by);
+CREATE TABLE IF NOT EXISTS entities (
+  key TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  type TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS memory_entities (
+  memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+  entity_key TEXT NOT NULL REFERENCES entities(key),
+  PRIMARY KEY (memory_id, entity_key)
+);
+CREATE TABLE IF NOT EXISTS memory_links (
+  from_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+  to_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (from_id, to_id)
+);
+CREATE TABLE IF NOT EXISTS moods (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id),
+  label TEXT NOT NULL,
+  valence INTEGER NOT NULL,
+  note TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_moods_user ON moods(user_id, created_at);
+"""
+
+# 过期记忆先按 expires_at 从检索里消失，再宽限这么多天才真正物理删除，留出反悔窗口。
+_PURGE_GRACE_DAYS = 7
 
 
 class MemoryStore:
+    """SQLite 存储：向量（float16 BLOB）暴力余弦 + 等级/新近度/关键词加权检索。
+
+    单写连接 + 线程锁串行化写入，所有调用经 asyncio.to_thread 下沉，
+    对上层保持与旧图数据库版一致的 async 接口。
+    """
+
     def __init__(self, settings: Settings):
         self.settings = settings
-        self.driver = AsyncGraphDatabase.driver(
-            settings.neo4j_uri,
-            auth=(settings.neo4j_user, settings.neo4j_password),
-        )
-        # SEARCH 查询失败时一次性翻转为 True，改用 legacy proc 查询。
-        self._use_legacy_vector = False
+        self._conn: sqlite3.Connection | None = None
+        self._lock = threading.Lock()
+
+    async def _run(self, fn: Callable[[sqlite3.Connection], T]) -> T:
+        def call() -> T:
+            assert self._conn is not None, "MemoryStore 尚未 connect()"
+            with self._lock:
+                return fn(self._conn)
+
+        return await asyncio.to_thread(call)
+
+    async def connect(self, attempts: int = 1) -> None:
+        def open_db() -> sqlite3.Connection:
+            path = Path(self.settings.db_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(path, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.executescript(_SCHEMA)
+            conn.commit()
+            return conn
+
+        self._conn = await asyncio.to_thread(open_db)
+        await self._run(self._purge_expired)
 
     async def close(self) -> None:
-        await self.driver.close()
-
-    async def connect(self, attempts: int = 30) -> None:
-        last_error: Exception | None = None
-        for attempt in range(attempts):
-            try:
-                await self.driver.verify_connectivity()
-                await self.init_schema()
-                return
-            except Exception as exc:
-                last_error = exc
-                if attempt == attempts - 1:
-                    break
-                await asyncio.sleep(min(2 + attempt, 10))
-        raise RuntimeError(f"无法连接或初始化 Neo4j：{last_error}") from last_error
+        if self._conn is not None:
+            conn = self._conn
+            self._conn = None
+            await asyncio.to_thread(conn.close)
 
     async def ping(self) -> bool:
         try:
-            await self.driver.execute_query(
-                "RETURN 1 AS ok", database_=self.settings.neo4j_database
-            )
+            await self._run(lambda conn: conn.execute("SELECT 1").fetchone())
             return True
         except Exception:
             return False
 
-    async def init_schema(self) -> None:
-        constraints = [
-            "CREATE CONSTRAINT user_id IF NOT EXISTS FOR (u:User) REQUIRE u.id IS UNIQUE",
-            "CREATE CONSTRAINT memory_id IF NOT EXISTS FOR (m:Memory) REQUIRE m.id IS UNIQUE",
-            "CREATE CONSTRAINT conversation_id IF NOT EXISTS FOR (c:Conversation) REQUIRE c.id IS UNIQUE",
-            "CREATE CONSTRAINT message_id IF NOT EXISTS FOR (m:Message) REQUIRE m.id IS UNIQUE",
-            "CREATE CONSTRAINT entity_key IF NOT EXISTS FOR (e:Entity) REQUIRE e.key IS UNIQUE",
-            "CREATE CONSTRAINT mood_id IF NOT EXISTS FOR (m:Mood) REQUIRE m.id IS UNIQUE",
-        ]
-        for query in constraints:
-            await self.driver.execute_query(query, database_=self.settings.neo4j_database)
-        vector_query = f"""
-        CREATE VECTOR INDEX memory_embedding IF NOT EXISTS
-        FOR (m:Memory) ON m.embedding
-        OPTIONS {{indexConfig: {{
-          `vector.dimensions`: {self.settings.embedding_dimensions},
-          `vector.similarity_function`: 'cosine'
-        }}}}
-        """
-        await self.driver.execute_query(vector_query, database_=self.settings.neo4j_database)
+    # ---------- 对话历史 ----------
 
     async def save_message(
         self, user_id: str, conversation_id: str, role: str, content: str
     ) -> str:
         message_id = str(uuid.uuid4())
         now = utc_now()
-        query = """
-        MERGE (u:User {id: $user_id})
-          ON CREATE SET u.created_at = $now
-        MERGE (c:Conversation {id: $conversation_id})
-          ON CREATE SET c.created_at = $now, c.user_id = $user_id
-        WITH u, c
-        WHERE c.user_id = $user_id
-        MERGE (u)-[:HAS_CONVERSATION]->(c)
-        SET c.message_count = coalesce(c.message_count, 0) + 1, c.updated_at = $now
-        CREATE (m:Message {
-          id: $message_id, role: $role, content: $content,
-          created_at: $now, seq: c.message_count
-        })
-        MERGE (c)-[:HAS_MESSAGE]->(m)
-        RETURN m.id AS id
-        """
-        records, _, _ = await self.driver.execute_query(
-            query,
-            user_id=user_id,
-            conversation_id=conversation_id,
-            message_id=message_id,
-            role=role,
-            content=content,
-            now=now,
-            database_=self.settings.neo4j_database,
-        )
-        if not records:
-            raise ValueError("conversation_id 已属于其他用户")
-        return message_id
+
+        def write(conn: sqlite3.Connection) -> str:
+            with conn:
+                conn.execute(
+                    "INSERT OR IGNORE INTO users (id, created_at) VALUES (?, ?)",
+                    (user_id, now),
+                )
+                row = conn.execute(
+                    "SELECT user_id FROM conversations WHERE id = ?", (conversation_id,)
+                ).fetchone()
+                if row is None:
+                    conn.execute(
+                        "INSERT INTO conversations (id, user_id, created_at, updated_at)"
+                        " VALUES (?, ?, ?, ?)",
+                        (conversation_id, user_id, now, now),
+                    )
+                elif row["user_id"] != user_id:
+                    raise ValueError("conversation_id 已属于其他用户")
+                seq = conn.execute(
+                    "UPDATE conversations SET message_count = message_count + 1,"
+                    " updated_at = ? WHERE id = ? RETURNING message_count",
+                    (now, conversation_id),
+                ).fetchone()["message_count"]
+                conn.execute(
+                    "INSERT INTO messages (id, conversation_id, seq, role, content, created_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    (message_id, conversation_id, seq, role, content, now),
+                )
+            return message_id
+
+        return await self._run(write)
 
     async def get_history(
         self, user_id: str, conversation_id: str, limit: int
     ) -> list[dict[str, str]]:
         if limit <= 0:
             return []
-        query = """
-        MATCH (:User {id: $user_id})-[:HAS_CONVERSATION]->
-              (:Conversation {id: $conversation_id})-[:HAS_MESSAGE]->(m:Message)
-        RETURN m.role AS role, m.content AS content, m.created_at AS created_at
-        ORDER BY coalesce(m.seq, 0) DESC, m.created_at DESC
-        LIMIT $limit
-        """
-        records, _, _ = await self.driver.execute_query(
-            query,
-            user_id=user_id,
-            conversation_id=conversation_id,
-            limit=limit,
-            database_=self.settings.neo4j_database,
-        )
-        return [
-            {"role": record["role"], "content": record["content"]}
-            for record in reversed(records)
-            if record["role"] in {"user", "assistant"}
-        ]
+
+        def read(conn: sqlite3.Connection) -> list[dict[str, str]]:
+            rows = conn.execute(
+                "SELECT m.role, m.content FROM messages m"
+                " JOIN conversations c ON c.id = m.conversation_id"
+                " WHERE c.id = ? AND c.user_id = ? AND m.role IN ('user', 'assistant')"
+                " ORDER BY m.seq DESC LIMIT ?",
+                (conversation_id, user_id, limit),
+            ).fetchall()
+            return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
+
+        return await self._run(read)
 
     async def get_last_message_at(self, user_id: str, conversation_id: str) -> str | None:
-        query = """
-        MATCH (:User {id: $user_id})-[:HAS_CONVERSATION]->
-              (:Conversation {id: $conversation_id})-[:HAS_MESSAGE]->(m:Message)
-        RETURN m.created_at AS created_at
-        ORDER BY coalesce(m.seq, 0) DESC
-        LIMIT 1
-        """
-        records, _, _ = await self.driver.execute_query(
-            query,
-            user_id=user_id,
-            conversation_id=conversation_id,
-            database_=self.settings.neo4j_database,
-        )
-        return records[0]["created_at"] if records else None
+        def read(conn: sqlite3.Connection) -> str | None:
+            row = conn.execute(
+                "SELECT m.created_at FROM messages m"
+                " JOIN conversations c ON c.id = m.conversation_id"
+                " WHERE c.id = ? AND c.user_id = ? ORDER BY m.seq DESC LIMIT 1",
+                (conversation_id, user_id),
+            ).fetchone()
+            return row["created_at"] if row else None
+
+        return await self._run(read)
 
     async def get_conversation_summary(self, user_id: str, conversation_id: str) -> str:
-        query = """
-        MATCH (:User {id: $user_id})-[:HAS_CONVERSATION]->(c:Conversation {id: $conversation_id})
-        RETURN coalesce(c.summary, '') AS summary
-        """
-        records, _, _ = await self.driver.execute_query(
-            query,
-            user_id=user_id,
-            conversation_id=conversation_id,
-            database_=self.settings.neo4j_database,
-        )
-        return records[0]["summary"] if records else ""
+        def read(conn: sqlite3.Connection) -> str:
+            row = conn.execute(
+                "SELECT summary FROM conversations WHERE id = ? AND user_id = ?",
+                (conversation_id, user_id),
+            ).fetchone()
+            return row["summary"] if row else ""
+
+        return await self._run(read)
 
     async def messages_to_summarize(
         self, user_id: str, conversation_id: str, window: int, limit: int = 200
     ) -> dict[str, Any] | None:
         """取已滑出短期窗口（seq <= total-window）且尚未摘要（seq > summary_upto_seq）的旧消息。"""
-        query = """
-        MATCH (:User {id: $user_id})-[:HAS_CONVERSATION]->(c:Conversation {id: $conversation_id})
-        WITH c, coalesce(c.summary, '') AS summary,
-             coalesce(c.summary_upto_seq, 0) AS upto,
-             coalesce(c.message_count, 0) AS total
-        MATCH (c)-[:HAS_MESSAGE]->(m:Message)
-        WHERE coalesce(m.seq, 0) > upto AND coalesce(m.seq, 0) <= total - $window
-          AND m.role IN ['user', 'assistant']
-        WITH summary, m ORDER BY coalesce(m.seq, 0) ASC LIMIT $limit
-        RETURN summary AS summary,
-               collect({role: m.role, content: m.content}) AS messages,
-               max(coalesce(m.seq, 0)) AS max_seq
-        """
-        records, _, _ = await self.driver.execute_query(
-            query,
-            user_id=user_id,
-            conversation_id=conversation_id,
-            window=max(window, 0),
-            limit=min(max(limit, 1), 1000),
-            database_=self.settings.neo4j_database,
-        )
-        if not records or not records[0]["messages"]:
-            return None
-        row = records[0]
-        return {
-            "summary": row["summary"],
-            "messages": list(row["messages"]),
-            "max_seq": row["max_seq"],
-        }
+
+        def read(conn: sqlite3.Connection) -> dict[str, Any] | None:
+            convo = conn.execute(
+                "SELECT summary, summary_upto_seq, message_count FROM conversations"
+                " WHERE id = ? AND user_id = ?",
+                (conversation_id, user_id),
+            ).fetchone()
+            if convo is None:
+                return None
+            rows = conn.execute(
+                "SELECT role, content, seq FROM messages"
+                " WHERE conversation_id = ? AND seq > ? AND seq <= ?"
+                " AND role IN ('user', 'assistant') ORDER BY seq ASC LIMIT ?",
+                (
+                    conversation_id,
+                    convo["summary_upto_seq"],
+                    convo["message_count"] - max(window, 0),
+                    min(max(limit, 1), 1000),
+                ),
+            ).fetchall()
+            if not rows:
+                return None
+            return {
+                "summary": convo["summary"],
+                "messages": [{"role": r["role"], "content": r["content"]} for r in rows],
+                "max_seq": rows[-1]["seq"],
+            }
+
+        return await self._run(read)
 
     async def update_conversation_summary(
         self, user_id: str, conversation_id: str, summary: str, upto_seq: int
     ) -> None:
-        query = """
-        MATCH (:User {id: $user_id})-[:HAS_CONVERSATION]->(c:Conversation {id: $conversation_id})
-        SET c.summary = $summary, c.summary_upto_seq = $upto_seq, c.summary_at = $now
-        """
-        await self.driver.execute_query(
-            query,
-            user_id=user_id,
-            conversation_id=conversation_id,
-            summary=summary,
-            upto_seq=upto_seq,
-            now=utc_now(),
-            database_=self.settings.neo4j_database,
-        )
+        def write(conn: sqlite3.Connection) -> None:
+            with conn:
+                conn.execute(
+                    "UPDATE conversations SET summary = ?, summary_upto_seq = ?, summary_at = ?"
+                    " WHERE id = ? AND user_id = ?",
+                    (summary, upto_seq, utc_now(), conversation_id, user_id),
+                )
+
+        await self._run(write)
+
+    # ---------- 长期记忆 ----------
+
+    def _memory_view(
+        self, conn: sqlite3.Connection, row: sqlite3.Row, score: float | None = None
+    ) -> dict[str, Any]:
+        entities = [
+            {"name": r["name"], "type": r["type"]}
+            for r in conn.execute(
+                "SELECT e.name, e.type FROM memory_entities me"
+                " JOIN entities e ON e.key = me.entity_key WHERE me.memory_id = ?",
+                (row["id"],),
+            )
+        ]
+        view: dict[str, Any] = {
+            "id": row["id"],
+            "text": row["text"],
+            "kind": row["kind"],
+            "level": row["level"],
+            "subject": row["subject"],
+            "created_at": row["created_at"],
+            "entities": entities,
+        }
+        if score is not None:
+            view["score"] = round(float(score), 6)
+        return view
 
     async def search_memories(
         self,
@@ -233,136 +351,117 @@ class MemoryStore:
         limit: int | None = None,
         min_score: float | None = None,
         temporal_ranking: bool = True,
+        query_text: str = "",
     ) -> list[dict[str, Any]]:
         limit = limit or self.settings.memory_search_limit
         min_score = self.settings.memory_min_score if min_score is None else min_score
-        candidate_limit = min(max(limit * 5, limit), 250)
-        params: dict[str, Any] = {
-            "candidate_limit": candidate_limit,
-            "embedding": embedding,
-            "user_id": user_id,
-            "min_score": min_score,
-            "limit": limit,
-            "now": utc_now(),
-        }
-        # 优先用 CYPHER 25 的 SEARCH + 时序加权；若该 Neo4j 构建不支持，则一次性回退到
-        # 旧 proc，保证检索可用（过渡保险，待确认线上稳定后可移除 legacy 分支）。
-        if not self._use_legacy_vector:
-            try:
-                records = await self._run_vector_search(params, temporal_ranking)
-                return _strip_internal(records)
-            except Exception as exc:
-                if "POPULATING" in str(exc).upper():
-                    logger.warning("Vector index is still populating; returning no memories")
-                    return []
-                logger.warning("SEARCH 向量查询不可用，已回退到 legacy 查询：%s", exc)
-                self._use_legacy_vector = True
-        try:
-            records = await self._run_legacy_vector_search(params)
-        except Exception as exc:
-            if "POPULATING" in str(exc).upper():
-                logger.warning("Vector index is still populating; returning no memories")
+        now = utc_now()
+        query = np.asarray(embedding, dtype=np.float32)
+        settings = self.settings
+        tokens = _keyword_tokens(query_text) if query_text else []
+
+        def read(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+            rows = conn.execute(
+                "SELECT id, text, kind, level, subject, created_at, last_seen_at, embedding"
+                " FROM memories WHERE user_id = ? AND active = 1"
+                " AND (expires_at IS NULL OR expires_at > ?)",
+                (user_id, now),
+            ).fetchall()
+            if not rows:
                 return []
-            raise
-        return _strip_internal(records)
+            matrix = np.stack([_blob_to_vec(r["embedding"]) for r in rows])
+            # 向量在入库前已 L2 归一化，点积即余弦相似度。
+            similarity = matrix @ query
 
-    async def _run_vector_search(
-        self, params: dict[str, Any], temporal_ranking: bool
-    ) -> list[dict[str, Any]]:
-        # 去重等场景只看相似度，把时序权重清零即可退回纯向量排序。
-        recency_weight = self.settings.memory_recency_weight if temporal_ranking else 0.0
-        importance_weight = (
-            self.settings.memory_importance_weight if temporal_ranking else 0.0
-        )
-        # CYPHER 25 的 SEARCH 子句取代了已弃用的 db.index.vector.queryNodes。
-        # 向量召回后在图内叠加新近度/重要性，得到时序加权的综合排序。
-        query = """CYPHER 25
-        MATCH (node:Memory)
-          SEARCH node IN (
-            VECTOR INDEX memory_embedding
-            FOR $embedding
-            LIMIT $candidate_limit
-          ) SCORE AS score
-        MATCH (u:User {id: $user_id})-[:HAS_MEMORY]->(node)
-        WHERE coalesce(node.active, true) = true AND score >= $min_score
-        WITH node, score,
-             (datetime($now).epochSeconds
-              - datetime(coalesce(node.last_seen_at, node.created_at, $now)).epochSeconds)
-             / 86400.0 AS age_days
-        WITH node, score,
-             1.0 / (1.0 + (CASE WHEN age_days < 0 THEN 0.0 ELSE age_days END)
-                          / $recency_halflife_days) AS recency
-        OPTIONAL MATCH (node)-[:MENTIONS]->(e:Entity)
-        WITH node, score, recency,
-             collect(DISTINCT {name: e.name, type: e.type}) AS raw_entities
-        SET node.access_count = coalesce(node.access_count, 0) + 1,
-            node.last_accessed_at = $now
-        RETURN node.id AS id, node.text AS text, node.kind AS kind,
-               node.importance AS importance, node.created_at AS created_at,
-               coalesce(node.subject, 'user') AS subject,
-               score, [entity IN raw_entities WHERE entity.name IS NOT NULL] AS entities,
-               score * $similarity_weight
-                 + recency * $recency_weight
-                 + ((coalesce(node.importance, 3) - 1) / 4.0) * $importance_weight
-                 AS final_score
-        ORDER BY final_score DESC
-        LIMIT $limit
-        """
-        records, _, _ = await self.driver.execute_query(
-            query,
-            recency_halflife_days=self.settings.memory_recency_halflife_days,
-            similarity_weight=self.settings.memory_similarity_weight,
-            recency_weight=recency_weight,
-            importance_weight=importance_weight,
-            database_=self.settings.neo4j_database,
-            **params,
-        )
-        return [dict(record) for record in records]
+            recency_weight = settings.memory_recency_weight if temporal_ranking else 0.0
+            level_weight = settings.memory_importance_weight if temporal_ranking else 0.0
+            keyword_weight = settings.memory_keyword_weight if temporal_ranking else 0.0
+            now_dt = datetime.fromisoformat(now)
 
-    async def _run_legacy_vector_search(
-        self, params: dict[str, Any]
-    ) -> list[dict[str, Any]]:
-        query = """
-        CALL db.index.vector.queryNodes('memory_embedding', $candidate_limit, $embedding)
-        YIELD node, score
-        MATCH (u:User {id: $user_id})-[:HAS_MEMORY]->(node)
-        WHERE coalesce(node.active, true) = true AND score >= $min_score
-        OPTIONAL MATCH (node)-[:MENTIONS]->(e:Entity)
-        WITH node, score, collect(DISTINCT {name: e.name, type: e.type}) AS raw_entities
-        SET node.access_count = coalesce(node.access_count, 0) + 1,
-            node.last_accessed_at = $now
-        RETURN node.id AS id, node.text AS text, node.kind AS kind,
-               node.importance AS importance, node.created_at AS created_at,
-               coalesce(node.subject, 'user') AS subject,
-               score, [entity IN raw_entities WHERE entity.name IS NOT NULL] AS entities
-        ORDER BY score DESC
-        LIMIT $limit
-        """
-        records, _, _ = await self.driver.execute_query(
-            query, database_=self.settings.neo4j_database, **params
-        )
-        return [dict(record) for record in records]
+            scored: list[tuple[float, float, sqlite3.Row]] = []
+            for row, sim in zip(rows, similarity, strict=True):
+                sim = float(sim)
+                if sim < min_score:
+                    continue
+                final = sim * settings.memory_similarity_weight
+                if recency_weight:
+                    age_days = max(
+                        (now_dt - datetime.fromisoformat(row["last_seen_at"])).total_seconds()
+                        / 86400.0,
+                        0.0,
+                    )
+                    final += recency_weight / (
+                        1.0 + age_days / settings.memory_recency_halflife_days
+                    )
+                if level_weight:
+                    final += level_weight * (row["level"] / 10.0)
+                if keyword_weight and tokens:
+                    text = row["text"]
+                    if any(token in text for token in tokens):
+                        final += keyword_weight
+                scored.append((final, sim, row))
+            scored.sort(key=lambda item: item[0], reverse=True)
+            top = scored[:limit]
+            if top:
+                with conn:
+                    conn.executemany(
+                        "UPDATE memories SET access_count = access_count + 1,"
+                        " last_accessed_at = ? WHERE id = ?",
+                        [(now, row["id"]) for _, _, row in top],
+                    )
+            return [self._memory_view(conn, row, score=sim) for _, sim, row in top]
+
+        return await self._run(read)
 
     async def recent_memories(self, user_id: str, limit: int = 10) -> list[dict[str, Any]]:
-        query = """
-        MATCH (:User {id: $user_id})-[:HAS_MEMORY]->(m:Memory)
-        WHERE coalesce(m.active, true) = true
-        OPTIONAL MATCH (m)-[:MENTIONS]->(e:Entity)
-        WITH m, collect(DISTINCT {name: e.name, type: e.type}) AS raw_entities
-        RETURN m.id AS id, m.text AS text, m.kind AS kind,
-               m.importance AS importance, m.created_at AS created_at,
-               coalesce(m.subject, 'user') AS subject,
-               [entity IN raw_entities WHERE entity.name IS NOT NULL] AS entities
-        ORDER BY coalesce(m.last_seen_at, m.created_at) DESC
-        LIMIT $limit
-        """
-        records, _, _ = await self.driver.execute_query(
-            query,
-            user_id=user_id,
-            limit=min(max(limit, 1), 100),
-            database_=self.settings.neo4j_database,
-        )
-        return [dict(record) for record in records]
+        now = utc_now()
+
+        def read(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+            rows = conn.execute(
+                "SELECT * FROM memories WHERE user_id = ? AND active = 1"
+                " AND (expires_at IS NULL OR expires_at > ?)"
+                " ORDER BY last_seen_at DESC LIMIT ?",
+                (user_id, now, min(max(limit, 1), 100)),
+            ).fetchall()
+            return [self._memory_view(conn, row) for row in rows]
+
+        return await self._run(read)
+
+    def _purge_expired(self, conn: sqlite3.Connection) -> None:
+        deadline = (
+            datetime.now(UTC) - timedelta(days=_PURGE_GRACE_DAYS)
+        ).isoformat()
+        with conn:
+            deleted = conn.execute(
+                "DELETE FROM memories WHERE expires_at IS NOT NULL AND expires_at < ?"
+                " AND superseded_by IS NULL",
+                (deadline,),
+            ).rowcount
+        if deleted:
+            logger.info("已清理 %d 条过期记忆", deleted)
+
+    def _touch_memory(
+        self, conn: sqlite3.Connection, row: sqlite3.Row, level: int, now: str
+    ) -> dict[str, Any]:
+        """同一记忆再次出现：续期、升级（取更高等级）、计数。"""
+        new_level = max(row["level"], level)
+        with conn:
+            conn.execute(
+                "UPDATE memories SET last_seen_at = ?, repetitions = repetitions + 1,"
+                " level = ?, expires_at = ? WHERE id = ?",
+                (
+                    now,
+                    new_level,
+                    level_expiry(new_level, self.settings.memory_level_ttls, now),
+                    row["id"],
+                ),
+            )
+        refreshed = conn.execute(
+            "SELECT * FROM memories WHERE id = ?", (row["id"],)
+        ).fetchone()
+        view = self._memory_view(conn, refreshed)
+        view["deduplicated"] = True
+        return view
 
     async def create_memory(
         self,
@@ -370,183 +469,111 @@ class MemoryStore:
         user_id: str,
         text: str,
         kind: str,
-        importance: int,
+        level: int,
         entities: list[dict[str, str]],
         embedding: list[float],
         source: str,
         subject: str = "user",
     ) -> dict[str, Any]:
         subject = subject if subject in {"user", "assistant"} else "user"
+        level = min(max(int(level), 1), 10)
         text = text.strip()
         fingerprint = hashlib.sha256(text.casefold().encode("utf-8")).hexdigest()
         now = utc_now()
-        # 去重按主体隔离：同样文本但主体不同（关于用户 vs 关于助手）不应合并。
-        existing_query = """
-        MATCH (:User {id: $user_id})-[:HAS_MEMORY]->(m:Memory {fingerprint: $fingerprint})
-        WHERE coalesce(m.active, true) = true AND coalesce(m.subject, 'user') = $subject
-        SET m.last_seen_at = $now,
-            m.repetitions = coalesce(m.repetitions, 1) + 1,
-            m.importance = CASE WHEN m.importance < $importance THEN $importance ELSE m.importance END
-        RETURN m.id AS id, m.text AS text, m.kind AS kind,
-               m.importance AS importance, m.created_at AS created_at,
-               coalesce(m.subject, 'user') AS subject
-        LIMIT 1
-        """
-        records, _, _ = await self.driver.execute_query(
-            existing_query,
-            user_id=user_id,
-            fingerprint=fingerprint,
-            importance=importance,
-            now=now,
-            subject=subject,
-            database_=self.settings.neo4j_database,
-        )
-        if records:
-            result = dict(records[0])
-            result["entities"] = entities
-            result["deduplicated"] = True
-            return result
+        query = np.asarray(embedding, dtype=np.float32)
+        settings = self.settings
 
-        # Qwen3-Embedding 支持 Matryoshka 截维。用极高阈值合并近乎完全相同的
-        # 规范化表述；默认 0.995，避免把“喜欢 X”和“不喜欢 X”误合并。
-        try:
-            candidates = await self.search_memories(
-                user_id,
-                embedding,
-                limit=1,
-                min_score=self.settings.memory_duplicate_threshold,
-                temporal_ranking=False,
-            )
-        except Exception:
-            candidates = []
-        if (
-            candidates
-            and candidates[0].get("kind") == kind
-            and candidates[0].get("subject", "user") == subject
-        ):
-            candidate = candidates[0]
-            update_query = """
-            MATCH (:User {id: $user_id})-[:HAS_MEMORY]->(m:Memory {id: $memory_id})
-            SET m.last_seen_at = $now,
-                m.repetitions = coalesce(m.repetitions, 1) + 1,
-                m.importance = CASE WHEN m.importance < $importance THEN $importance ELSE m.importance END
-            RETURN m.id AS id, m.text AS text, m.kind AS kind,
-                   m.importance AS importance, m.created_at AS created_at,
-                   coalesce(m.subject, 'user') AS subject
-            """
-            records, _, _ = await self.driver.execute_query(
-                update_query,
-                user_id=user_id,
-                memory_id=candidate["id"],
-                importance=importance,
-                now=now,
-                database_=self.settings.neo4j_database,
-            )
-            if records:
-                result = dict(records[0])
-                result["entities"] = candidate.get("entities", [])
-                result["deduplicated"] = True
-                return result
+        def write(conn: sqlite3.Connection) -> dict[str, Any]:
+            self._purge_expired(conn)
+            # 去重按主体隔离：同样文本但主体不同（关于用户 vs 关于助手）不应合并。
+            existing = conn.execute(
+                "SELECT * FROM memories WHERE user_id = ? AND fingerprint = ?"
+                " AND active = 1 AND subject = ? LIMIT 1",
+                (user_id, fingerprint, subject),
+            ).fetchone()
+            if existing is not None:
+                return self._touch_memory(conn, existing, level, now)
 
-        memory_id = str(uuid.uuid4())
-        safe_entities = []
-        for entity in entities[:30]:
-            if not isinstance(entity, dict):
-                continue
-            name = str(entity.get("name", "")).strip()[:200]
-            entity_type = str(entity.get("type", "entity")).strip()[:80] or "entity"
-            if name:
-                safe_entities.append(
-                    {
-                        "name": name,
-                        "type": entity_type,
-                        "key": f"{entity_type.casefold()}:{name.casefold()}",
-                    }
+            # 近乎完全相同的规范化表述用极高阈值合并（默认 0.995），
+            # 避免把“喜欢 X”和“不喜欢 X”误合并。
+            candidates = conn.execute(
+                "SELECT * FROM memories WHERE user_id = ? AND active = 1"
+                " AND subject = ? AND kind = ?"
+                " AND (expires_at IS NULL OR expires_at > ?)",
+                (user_id, subject, kind, now),
+            ).fetchall()
+            for row in candidates:
+                if float(_blob_to_vec(row["embedding"]) @ query) >= settings.memory_duplicate_threshold:
+                    return self._touch_memory(conn, row, level, now)
+
+            memory_id = str(uuid.uuid4())
+            safe_entities = []
+            for entity in entities[:30]:
+                if not isinstance(entity, dict):
+                    continue
+                name = str(entity.get("name", "")).strip()[:200]
+                entity_type = str(entity.get("type", "entity")).strip()[:80] or "entity"
+                if name:
+                    safe_entities.append(
+                        {
+                            "name": name,
+                            "type": entity_type,
+                            "key": f"{entity_type.casefold()}:{name.casefold()}",
+                        }
+                    )
+            with conn:
+                conn.execute(
+                    "INSERT OR IGNORE INTO users (id, created_at) VALUES (?, ?)",
+                    (user_id, now),
                 )
-        query = """
-        MERGE (u:User {id: $user_id})
-          ON CREATE SET u.created_at = $now
-        CREATE (m:Memory {
-          id: $memory_id, text: $text, kind: $kind, importance: $importance,
-          subject: $subject, embedding: $embedding, fingerprint: $fingerprint, source: $source,
-          active: true, repetitions: 1, access_count: 0,
-          created_at: $now, last_seen_at: $now
-        })
-        MERGE (u)-[:HAS_MEMORY]->(m)
-        WITH m
-        UNWIND $entities AS entity
-        MERGE (e:Entity {key: entity.key})
-          ON CREATE SET e.name = entity.name, e.type = entity.type, e.created_at = $now
-        MERGE (m)-[:MENTIONS]->(e)
-        RETURN m.id AS id, m.text AS text, m.kind AS kind,
-               m.importance AS importance, m.created_at AS created_at, m.subject AS subject
-        """
-        if safe_entities:
-            records, _, _ = await self.driver.execute_query(
-                query,
-                user_id=user_id,
-                memory_id=memory_id,
-                text=text,
-                kind=kind,
-                importance=importance,
-                subject=subject,
-                embedding=embedding,
-                fingerprint=fingerprint,
-                source=source,
-                entities=safe_entities,
-                now=now,
-                database_=self.settings.neo4j_database,
-            )
-            result = dict(records[0])
-        else:
-            no_entity_query = """
-            MERGE (u:User {id: $user_id})
-              ON CREATE SET u.created_at = $now
-            CREATE (m:Memory {
-              id: $memory_id, text: $text, kind: $kind, importance: $importance,
-              subject: $subject, embedding: $embedding, fingerprint: $fingerprint, source: $source,
-              active: true, repetitions: 1, access_count: 0,
-              created_at: $now, last_seen_at: $now
-            })
-            MERGE (u)-[:HAS_MEMORY]->(m)
-            RETURN m.id AS id, m.text AS text, m.kind AS kind,
-                   m.importance AS importance, m.created_at AS created_at, m.subject AS subject
-            """
-            records, _, _ = await self.driver.execute_query(
-                no_entity_query,
-                user_id=user_id,
-                memory_id=memory_id,
-                text=text,
-                kind=kind,
-                importance=importance,
-                subject=subject,
-                embedding=embedding,
-                fingerprint=fingerprint,
-                source=source,
-                now=now,
-                database_=self.settings.neo4j_database,
-            )
-            result = dict(records[0])
-        result["entities"] = [
-            {"name": entity["name"], "type": entity["type"]} for entity in safe_entities
-        ]
-        result["deduplicated"] = False
-        return result
+                conn.execute(
+                    "INSERT INTO memories (id, user_id, text, kind, level, subject,"
+                    " embedding, fingerprint, source, created_at, last_seen_at, expires_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        memory_id,
+                        user_id,
+                        text,
+                        kind,
+                        level,
+                        subject,
+                        _vec_to_blob(embedding),
+                        fingerprint,
+                        source,
+                        now,
+                        now,
+                        level_expiry(level, settings.memory_level_ttls, now),
+                    ),
+                )
+                for entity in safe_entities:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO entities (key, name, type, created_at)"
+                        " VALUES (?, ?, ?, ?)",
+                        (entity["key"], entity["name"], entity["type"], now),
+                    )
+                    conn.execute(
+                        "INSERT OR IGNORE INTO memory_entities (memory_id, entity_key)"
+                        " VALUES (?, ?)",
+                        (memory_id, entity["key"]),
+                    )
+            row = conn.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
+            view = self._memory_view(conn, row)
+            view["deduplicated"] = False
+            return view
+
+        return await self._run(write)
 
     async def forget_memory(self, user_id: str, memory_id: str) -> bool:
-        query = """
-        MATCH (:User {id: $user_id})-[:HAS_MEMORY]->(m:Memory {id: $memory_id})
-        SET m.active = false, m.forgotten_at = $now
-        RETURN count(m) AS changed
-        """
-        records, _, _ = await self.driver.execute_query(
-            query,
-            user_id=user_id,
-            memory_id=memory_id,
-            now=utc_now(),
-            database_=self.settings.neo4j_database,
-        )
-        return bool(records and records[0]["changed"])
+        def write(conn: sqlite3.Connection) -> bool:
+            with conn:
+                changed = conn.execute(
+                    "UPDATE memories SET active = 0, forgotten_at = ?"
+                    " WHERE id = ? AND user_id = ? AND active = 1",
+                    (utc_now(), memory_id, user_id),
+                ).rowcount
+            return bool(changed)
+
+        return await self._run(write)
 
     async def supersede_memory(
         self,
@@ -555,204 +582,214 @@ class MemoryStore:
         old_memory_id: str,
         text: str,
         kind: str,
-        importance: int,
+        level: int,
         entities: list[dict[str, str]],
         embedding: list[float],
         subject: str = "user",
     ) -> dict[str, Any]:
-        """用新内容取代一条旧记忆：新建（或复用）新记忆，建 SUPERSEDES 关系，软停用旧记忆。
+        """用新内容取代一条旧记忆：新建（或复用）新记忆并软停用旧记忆。
 
-        旧记忆保留在图里（active=false + superseded_by/at），可经 memory_history 回溯时间线。
+        旧记忆保留（active=0 + superseded_by/at），可经 memory_history 回溯时间线。
         """
         created = await self.create_memory(
             user_id=user_id,
             text=text,
             kind=kind,
-            importance=importance,
+            level=level,
             entities=entities,
             embedding=embedding,
             source="memory_update",
             subject=subject,
         )
-        now = utc_now()
-        link_query = """
-        MATCH (u:User {id: $user_id})-[:HAS_MEMORY]->(old:Memory {id: $old_id})
-        MATCH (u)-[:HAS_MEMORY]->(new:Memory {id: $new_id})
-        WHERE old.id <> new.id
-        MERGE (new)-[r:SUPERSEDES]->(old)
-          ON CREATE SET r.at = $now
-        SET old.active = false, old.superseded_by = $new_id, old.superseded_at = $now
-        RETURN old.id AS old_id
-        """
-        records, _, _ = await self.driver.execute_query(
-            link_query,
-            user_id=user_id,
-            old_id=old_memory_id,
-            new_id=created["id"],
-            now=now,
-            database_=self.settings.neo4j_database,
-        )
-        created["superseded"] = bool(records)
-        created["superseded_memory_id"] = old_memory_id if records else None
+
+        def link(conn: sqlite3.Connection) -> bool:
+            if created["id"] == old_memory_id:
+                return False
+            with conn:
+                changed = conn.execute(
+                    "UPDATE memories SET active = 0, superseded_by = ?, superseded_at = ?"
+                    " WHERE id = ? AND user_id = ?",
+                    (created["id"], utc_now(), old_memory_id, user_id),
+                ).rowcount
+            return bool(changed)
+
+        superseded = await self._run(link)
+        created["superseded"] = superseded
+        created["superseded_memory_id"] = old_memory_id if superseded else None
         return created
 
-    async def memory_history(
-        self, user_id: str, memory_id: str
-    ) -> list[dict[str, Any]]:
-        """沿 SUPERSEDES 链返回一条记忆的完整演变时间线（含已停用的历史版本）。"""
-        query = """
-        MATCH (u:User {id: $user_id})-[:HAS_MEMORY]->(m:Memory {id: $memory_id})
-        OPTIONAL MATCH (m)-[:SUPERSEDES*0..]->(older:Memory)
-        OPTIONAL MATCH (newer:Memory)-[:SUPERSEDES*0..]->(m)
-        WITH collect(DISTINCT older) + collect(DISTINCT newer) AS nodes
-        UNWIND nodes AS node
-        WITH DISTINCT node
-        WHERE node IS NOT NULL
-        RETURN node.id AS id, node.text AS text, node.kind AS kind,
-               node.importance AS importance, node.created_at AS created_at,
-               coalesce(node.subject, 'user') AS subject,
-               coalesce(node.active, true) AS active, node.superseded_at AS superseded_at
-        ORDER BY created_at
-        """
-        records, _, _ = await self.driver.execute_query(
-            query,
-            user_id=user_id,
-            memory_id=memory_id,
-            database_=self.settings.neo4j_database,
-        )
-        return [dict(record) for record in records]
+    async def memory_history(self, user_id: str, memory_id: str) -> list[dict[str, Any]]:
+        """沿取代链返回一条记忆的完整演变时间线（含已停用的历史版本）。"""
 
-    async def record_mood(
-        self, user_id: str, label: str, valence: int, note: str = ""
-    ) -> dict[str, Any]:
-        """记录一条情绪，并接到上一条情绪后面形成 NEXT_MOOD 时间链。"""
-        mood_id = str(uuid.uuid4())
-        now = utc_now()
-        query = """
-        MERGE (u:User {id: $user_id})
-          ON CREATE SET u.created_at = $now
-        CREATE (m:Mood {
-          id: $mood_id, label: $label, valence: $valence, note: $note, created_at: $now
-        })
-        MERGE (u)-[:HAS_MOOD]->(m)
-        WITH u, m
-        OPTIONAL MATCH (u)-[:HAS_MOOD]->(prev:Mood)
-        WHERE prev.id <> m.id
-        WITH m, prev ORDER BY prev.created_at DESC LIMIT 1
-        FOREACH (p IN CASE WHEN prev IS NULL THEN [] ELSE [prev] END |
-          MERGE (p)-[:NEXT_MOOD]->(m))
-        RETURN m.id AS id, m.label AS label, m.valence AS valence,
-               m.note AS note, m.created_at AS created_at
-        """
-        records, _, _ = await self.driver.execute_query(
-            query,
-            user_id=user_id,
-            mood_id=mood_id,
-            label=label,
-            valence=valence,
-            note=note,
-            now=now,
-            database_=self.settings.neo4j_database,
-        )
-        return dict(records[0]) if records else {"id": mood_id}
+        def read(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+            anchor = conn.execute(
+                "SELECT id FROM memories WHERE id = ? AND user_id = ?",
+                (memory_id, user_id),
+            ).fetchone()
+            if anchor is None:
+                return []
+            rows = conn.execute(
+                """
+                WITH RECURSIVE newer(id) AS (
+                  SELECT superseded_by FROM memories WHERE id = :mid AND superseded_by IS NOT NULL
+                  UNION
+                  SELECT m.superseded_by FROM memories m JOIN newer n ON m.id = n.id
+                  WHERE m.superseded_by IS NOT NULL
+                ), older(id) AS (
+                  SELECT id FROM memories WHERE superseded_by = :mid
+                  UNION
+                  SELECT m.id FROM memories m JOIN older o ON m.superseded_by = o.id
+                )
+                SELECT * FROM memories
+                WHERE user_id = :uid
+                  AND (id = :mid OR id IN (SELECT id FROM newer) OR id IN (SELECT id FROM older))
+                ORDER BY created_at
+                """,
+                {"mid": memory_id, "uid": user_id},
+            ).fetchall()
+            result = []
+            for row in rows:
+                view = self._memory_view(conn, row)
+                view["active"] = bool(row["active"])
+                view["superseded_at"] = row["superseded_at"]
+                result.append(view)
+            return result
 
-    async def mood_trend(self, user_id: str, days: int) -> dict[str, Any]:
-        """近 days 天的情绪聚合：条数、valence 均值、按时间倒序的标签序列。"""
-        query = """
-        MATCH (u:User {id: $user_id})-[:HAS_MOOD]->(m:Mood)
-        WHERE datetime(m.created_at) >= datetime($now) - duration({days: $days})
-        WITH m ORDER BY m.created_at DESC
-        RETURN count(m) AS count, avg(m.valence) AS avg_valence,
-               collect(m.label) AS labels, collect(m.created_at) AS times
-        """
-        records, _, _ = await self.driver.execute_query(
-            query,
-            user_id=user_id,
-            days=days,
-            now=utc_now(),
-            database_=self.settings.neo4j_database,
-        )
-        if not records or not records[0]["count"]:
-            return {"count": 0, "days": days}
-        row = records[0]
-        labels = list(row["labels"])
-        times = list(row["times"])
-        distribution: dict[str, int] = {}
-        for label in labels:
-            distribution[label] = distribution.get(label, 0) + 1
-        return {
-            "count": row["count"],
-            "days": days,
-            "avg_valence": float(row["avg_valence"]) if row["avg_valence"] is not None else 0.0,
-            "latest_label": labels[0] if labels else None,
-            "latest_at": times[0] if times else None,
-            "distribution": distribution,
-        }
-
-    async def recent_moods(self, user_id: str, limit: int) -> list[dict[str, Any]]:
-        query = """
-        MATCH (u:User {id: $user_id})-[:HAS_MOOD]->(m:Mood)
-        RETURN m.id AS id, m.label AS label, m.valence AS valence,
-               m.note AS note, m.created_at AS created_at
-        ORDER BY m.created_at DESC
-        LIMIT $limit
-        """
-        records, _, _ = await self.driver.execute_query(
-            query,
-            user_id=user_id,
-            limit=min(max(limit, 1), 500),
-            database_=self.settings.neo4j_database,
-        )
-        return [dict(record) for record in records]
+        return await self._run(read)
 
     async def link_memories(
         self, user_id: str, from_id: str, to_id: str, relation: str
     ) -> bool:
-        query = """
-        MATCH (u:User {id: $user_id})-[:HAS_MEMORY]->(a:Memory {id: $from_id})
-        MATCH (u)-[:HAS_MEMORY]->(b:Memory {id: $to_id})
-        MERGE (a)-[r:RELATED_TO]->(b)
-        SET r.kind = $relation, r.updated_at = $now
-        RETURN count(r) AS changed
-        """
-        records, _, _ = await self.driver.execute_query(
-            query,
-            user_id=user_id,
-            from_id=from_id,
-            to_id=to_id,
-            relation=clean_relation(relation),
-            now=utc_now(),
-            database_=self.settings.neo4j_database,
-        )
-        return bool(records and records[0]["changed"])
+        def write(conn: sqlite3.Connection) -> bool:
+            owned = conn.execute(
+                "SELECT count(*) AS n FROM memories WHERE user_id = ? AND id IN (?, ?)",
+                (user_id, from_id, to_id),
+            ).fetchone()["n"]
+            if owned != 2 or from_id == to_id:
+                return False
+            with conn:
+                conn.execute(
+                    "INSERT INTO memory_links (from_id, to_id, kind, updated_at)"
+                    " VALUES (?, ?, ?, ?)"
+                    " ON CONFLICT (from_id, to_id) DO UPDATE SET kind = excluded.kind,"
+                    " updated_at = excluded.updated_at",
+                    (from_id, to_id, clean_relation(relation), utc_now()),
+                )
+            return True
+
+        return await self._run(write)
 
     async def graph_snapshot(self, user_id: str, limit: int = 100) -> dict[str, Any]:
-        query = """
-        MATCH (u:User {id: $user_id})-[:HAS_MEMORY]->(m:Memory)
-        WHERE coalesce(m.active, true) = true
-        WITH u, m ORDER BY m.created_at DESC LIMIT $limit
-        OPTIONAL MATCH (m)-[:MENTIONS]->(e:Entity)
-        OPTIONAL MATCH (m)-[r:RELATED_TO]->(other:Memory)
-        RETURN collect(DISTINCT {
-          id: m.id, label: m.text, type: 'memory', kind: m.kind
-        }) + collect(DISTINCT {
-          id: e.key, label: e.name, type: 'entity', kind: e.type
-        }) AS nodes,
-        collect(DISTINCT CASE WHEN e IS NULL THEN NULL ELSE {
-          source: m.id, target: e.key, relation: 'mentions'
-        } END) + collect(DISTINCT CASE WHEN r IS NULL THEN NULL ELSE {
-          source: m.id, target: other.id, relation: r.kind
-        } END) AS edges
-        """
-        records, _, _ = await self.driver.execute_query(
-            query,
-            user_id=user_id,
-            limit=min(max(limit, 1), 500),
-            database_=self.settings.neo4j_database,
-        )
-        if not records:
-            return {"nodes": [], "edges": []}
-        return {
-            "nodes": [node for node in records[0]["nodes"] if node.get("id")],
-            "edges": [edge for edge in records[0]["edges"] if edge],
-        }
+        def read(conn: sqlite3.Connection) -> dict[str, Any]:
+            rows = conn.execute(
+                "SELECT id, text, kind FROM memories WHERE user_id = ? AND active = 1"
+                " ORDER BY created_at DESC LIMIT ?",
+                (user_id, min(max(limit, 1), 500)),
+            ).fetchall()
+            memory_ids = [row["id"] for row in rows]
+            nodes = [
+                {"id": row["id"], "label": row["text"], "type": "memory", "kind": row["kind"]}
+                for row in rows
+            ]
+            edges: list[dict[str, str]] = []
+            if memory_ids:
+                marks = ",".join("?" * len(memory_ids))
+                entity_rows = conn.execute(
+                    f"SELECT me.memory_id, e.key, e.name, e.type FROM memory_entities me"
+                    f" JOIN entities e ON e.key = me.entity_key"
+                    f" WHERE me.memory_id IN ({marks})",
+                    memory_ids,
+                ).fetchall()
+                seen_entities: set[str] = set()
+                for row in entity_rows:
+                    if row["key"] not in seen_entities:
+                        seen_entities.add(row["key"])
+                        nodes.append(
+                            {
+                                "id": row["key"],
+                                "label": row["name"],
+                                "type": "entity",
+                                "kind": row["type"],
+                            }
+                        )
+                    edges.append(
+                        {"source": row["memory_id"], "target": row["key"], "relation": "mentions"}
+                    )
+                link_rows = conn.execute(
+                    f"SELECT from_id, to_id, kind FROM memory_links"
+                    f" WHERE from_id IN ({marks})",
+                    memory_ids,
+                ).fetchall()
+                edges += [
+                    {"source": row["from_id"], "target": row["to_id"], "relation": row["kind"]}
+                    for row in link_rows
+                ]
+            return {"nodes": nodes, "edges": edges}
+
+        return await self._run(read)
+
+    # ---------- 情绪时间线 ----------
+
+    async def record_mood(
+        self, user_id: str, label: str, valence: int, note: str = ""
+    ) -> dict[str, Any]:
+        mood_id = str(uuid.uuid4())
+        now = utc_now()
+
+        def write(conn: sqlite3.Connection) -> dict[str, Any]:
+            with conn:
+                conn.execute(
+                    "INSERT OR IGNORE INTO users (id, created_at) VALUES (?, ?)",
+                    (user_id, now),
+                )
+                conn.execute(
+                    "INSERT INTO moods (id, user_id, label, valence, note, created_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    (mood_id, user_id, label, valence, note, now),
+                )
+            return {
+                "id": mood_id,
+                "label": label,
+                "valence": valence,
+                "note": note,
+                "created_at": now,
+            }
+
+        return await self._run(write)
+
+    async def mood_trend(self, user_id: str, days: int) -> dict[str, Any]:
+        """近 days 天的情绪聚合：条数、valence 均值、标签分布与最近一次。"""
+        since = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+
+        def read(conn: sqlite3.Connection) -> dict[str, Any]:
+            rows = conn.execute(
+                "SELECT label, valence, created_at FROM moods"
+                " WHERE user_id = ? AND created_at >= ? ORDER BY created_at DESC",
+                (user_id, since),
+            ).fetchall()
+            if not rows:
+                return {"count": 0, "days": days}
+            distribution: dict[str, int] = {}
+            for row in rows:
+                distribution[row["label"]] = distribution.get(row["label"], 0) + 1
+            return {
+                "count": len(rows),
+                "days": days,
+                "avg_valence": sum(row["valence"] for row in rows) / len(rows),
+                "latest_label": rows[0]["label"],
+                "latest_at": rows[0]["created_at"],
+                "distribution": distribution,
+            }
+
+        return await self._run(read)
+
+    async def recent_moods(self, user_id: str, limit: int) -> list[dict[str, Any]]:
+        def read(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+            rows = conn.execute(
+                "SELECT id, label, valence, note, created_at FROM moods"
+                " WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
+                (user_id, min(max(limit, 1), 500)),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+        return await self._run(read)

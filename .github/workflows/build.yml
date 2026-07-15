@@ -28,9 +28,17 @@ jobs:
       - name: Install Python dependencies
         run: python -m pip install -r app/requirements-dev.txt
 
-      - name: Test Python service
+      - name: Cache embedding model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: embedding-model-${{ hashFiles('app/src/config.py') }}
+          restore-keys: embedding-model-
+
+      - name: Test Python service (incl. real-model embedding smoke)
         env:
           PYTHONPATH: ${{ github.workspace }}/app
+          RUN_EMBEDDING_SMOKE: "1"
         run: python -m pytest -q
 
       - name: Set up Go

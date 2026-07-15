@@ -109,21 +109,26 @@ def format_time_context(last_message_at: str | None) -> str:
                 )
     return line
 
-MEMORY_JUDGE_PROMPT = """你是私人助手的长期记忆筛选器。只判断用户消息中是否包含未来多轮对话仍有价值、且与用户本人相关的信息。
+MEMORY_JUDGE_PROMPT = """你是私人助手的长期记忆筛选器。判断用户消息中是否包含未来多轮对话仍有价值、且与用户本人相关的信息，并给每条候选记忆评定 0..10 的记忆等级。
 
-应该记：稳定偏好、身份/背景事实、长期目标、持续项目、重要关系、明确约束、用户明确要求记住的事项。
-通常不记：寒暄、一次性问题、临时状态、可从常识推出的信息、助手自己说的话、仅为当前任务提供的材料。
+等级含义（决定这条记忆能保留多久，等级越高保留越久）：
+0 = 只对当前对话有用，不值得入库（临时状态、一次性问题、寒暄）；
+1-3 = 短期有效的近况（最近在忙什么、短期计划、几天内的安排）；
+4-6 = 中期事实（当前项目、阶段性目标、一般偏好）；
+7-9 = 长期稳定的事实（职业、重要关系、深层偏好、长期目标）；
+10 = 永久核心事实（姓名等身份信息、重大经历、用户明确要求永远记住的事）。
+
 绝不记：密码、API key、验证码、私钥、银行卡号、身份证号等秘密或高敏感凭证。若消息只含这类内容，should_remember=false。
-把记忆改写成独立、简短、无歧义的第三人称事实；不要保存整段原文。可拆成最多 5 条。
-kind 只能是 preference、fact、goal、relationship、constraint、event、other；importance 为 1..5。
-entities 只提取对图谱真正有用的人、组织、项目、地点或产品。
+把记忆改写成独立、简短、无歧义的第三人称事实；不要保存整段原文。可拆成最多 5 条，各自独立评级；全为 0 级则 should_remember=false。
+kind 只能是 preference、fact、goal、relationship、constraint、event、other。
+entities 只提取真正有用的人、组织、项目、地点或产品。
 
 同时判断用户本条消息流露的情绪：仅当明确流露情绪时给出 mood，否则 mood 为 null。
 mood.label 为简短情绪词（如 平静、开心、低落、焦虑、愤怒、疲惫、孤独、兴奋）；
 mood.valence 为整数 -2..2（很负面到很正面，平静约 0）；mood.note 为不含任何隐私凭证的简短缘由。
 
 只输出 JSON 对象，不要 Markdown：
-{"should_remember":true,"memories":[{"text":"用户偏好简洁的中文回答","kind":"preference","importance":3,"entities":[]}],"mood":{"label":"焦虑","valence":-1,"note":"担心明天的面试"}}"""
+{"should_remember":true,"memories":[{"text":"用户偏好简洁的中文回答","kind":"preference","level":6,"entities":[]}],"mood":{"label":"焦虑","valence":-1,"note":"担心明天的面试"}}"""
 
 TOOLS: list[dict[str, Any]] = [
     {
@@ -154,7 +159,12 @@ TOOLS: list[dict[str, Any]] = [
                         "type": "string",
                         "enum": ["preference", "fact", "goal", "relationship", "constraint", "event", "other"],
                     },
-                    "importance": {"type": "integer", "minimum": 1, "maximum": 5},
+                    "level": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 10,
+                        "description": "记忆等级，决定保留时长：1-3 短期近况，4-6 中期事实，7-9 长期稳定事实，10 永久核心事实。",
+                    },
                     "subject": {
                         "type": "string",
                         "enum": ["user", "assistant"],
@@ -169,7 +179,7 @@ TOOLS: list[dict[str, Any]] = [
                         },
                     },
                 },
-                "required": ["text", "kind", "importance"],
+                "required": ["text", "kind", "level"],
             },
         },
     },
@@ -203,7 +213,12 @@ TOOLS: list[dict[str, Any]] = [
                         "type": "string",
                         "enum": ["preference", "fact", "goal", "relationship", "constraint", "event", "other"],
                     },
-                    "importance": {"type": "integer", "minimum": 1, "maximum": 5},
+                    "level": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 10,
+                        "description": "记忆等级，决定保留时长：1-3 短期近况，4-6 中期事实，7-9 长期稳定事实，10 永久核心事实。",
+                    },
                     "subject": {
                         "type": "string",
                         "enum": ["user", "assistant"],
@@ -218,7 +233,7 @@ TOOLS: list[dict[str, Any]] = [
                         },
                     },
                 },
-                "required": ["old_memory_id", "text", "kind", "importance"],
+                "required": ["old_memory_id", "text", "kind", "level"],
             },
         },
     },
@@ -331,7 +346,9 @@ class MemoryAgent:
         history, query_vectors, mood_trend, summary, last_message_at = await asyncio.gather(
             history_task, query_vector_task, mood_task, summary_task, last_message_task
         )
-        retrieved = await self.store.search_memories(user_id, query_vectors[0])
+        retrieved = await self.store.search_memories(
+            user_id, query_vectors[0], query_text=message
+        )
 
         background = self._format_background(retrieved, summary)
         # 人设层在前、系统指令层在后并优先生效。
@@ -599,14 +616,17 @@ class MemoryAgent:
                 if kind not in allowed_kinds:
                     kind = "other"
                 try:
-                    importance = min(max(int(item.get("importance", 3)), 1), 5)
+                    level = min(max(int(item.get("level", 5)), 0), 10)
                 except (TypeError, ValueError):
-                    importance = 3
+                    level = 5
+                # 0 级 = 只对当前对话有用，不入长期记忆库。
+                if level == 0:
+                    continue
                 entities = (
                     item.get("entities") if isinstance(item.get("entities"), list) else []
                 )
                 result.append(
-                    {"text": text, "kind": kind, "importance": importance, "entities": entities}
+                    {"text": text, "kind": kind, "level": level, "entities": entities}
                 )
         return JudgeResult(memories=result, mood=mood)
 
@@ -623,7 +643,7 @@ class MemoryAgent:
                     user_id=user_id,
                     text=item["text"],
                     kind=item["kind"],
-                    importance=item["importance"],
+                    level=item["level"],
                     entities=item["entities"],
                     embedding=vector,
                     source="memory_judge",
@@ -705,7 +725,9 @@ class MemoryAgent:
                 raise ValueError("query 不能为空")
             limit = min(max(int(arguments.get("limit", 8)), 1), 20)
             vector = (await self.embedding.embed([query], is_query=True))[0]
-            return await self.store.search_memories(user_id, vector, limit=limit)
+            return await self.store.search_memories(
+                user_id, vector, limit=limit, query_text=query
+            )
         if name == "remember_memory":
             text = str(arguments.get("text", "")).strip()
             if not text:
@@ -717,14 +739,14 @@ class MemoryAgent:
                 "preference", "fact", "goal", "relationship", "constraint", "event", "other"
             }:
                 kind = "other"
-            importance = min(max(int(arguments.get("importance", 3)), 1), 5)
+            level = min(max(int(arguments.get("level", 5)), 1), 10)
             entities = arguments.get("entities") or []
             vector = (await self.embedding.embed([text]))[0]
             return await self.store.create_memory(
                 user_id=user_id,
                 text=text,
                 kind=kind,
-                importance=importance,
+                level=level,
                 entities=entities if isinstance(entities, list) else [],
                 embedding=vector,
                 source="chat_tool",
@@ -744,7 +766,7 @@ class MemoryAgent:
                 "preference", "fact", "goal", "relationship", "constraint", "event", "other"
             }:
                 kind = "other"
-            importance = min(max(int(arguments.get("importance", 3)), 1), 5)
+            level = min(max(int(arguments.get("level", 5)), 1), 10)
             entities = arguments.get("entities") or []
             vector = (await self.embedding.embed([text]))[0]
             return await self.store.supersede_memory(
@@ -752,7 +774,7 @@ class MemoryAgent:
                 old_memory_id=old_memory_id,
                 text=text,
                 kind=kind,
-                importance=importance,
+                level=level,
                 entities=entities if isinstance(entities, list) else [],
                 embedding=vector,
                 subject=str(arguments.get("subject", "user")),

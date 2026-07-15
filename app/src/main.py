@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -26,8 +27,6 @@ logging.basicConfig(
     level=getattr(logging, settings.log_level.upper(), logging.INFO),
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
-# Neo4j 把 db.index.vector.queryNodes 的弃用提醒按 WARNING 刷屏，但功能正常，先压成 ERROR。
-logging.getLogger("neo4j.notifications").setLevel(logging.ERROR)
 # httpx/httpcore 在 DEBUG 下会打印完整请求 URL（含 MCP key），兜底不低于 WARNING，避免泄露。
 for _noisy in ("httpx", "httpcore"):
     logging.getLogger(_noisy).setLevel(logging.WARNING)
@@ -42,6 +41,15 @@ async def lifespan(app: FastAPI):
     mcp = MCPManager(settings)
     await store.connect()
     await mcp.start()
+    # 预热本地 embedding（首次启动含模型下载），不阻塞服务就绪。
+    async def warmup() -> None:
+        try:
+            await embedding.warmup()
+        except Exception:
+            logger.warning("Embedding 预热失败", exc_info=True)
+
+    warmup_task = asyncio.create_task(warmup())
+    app.state.warmup_task = warmup_task
     app.state.store = store
     app.state.embedding = embedding
     app.state.llm = llm
@@ -55,9 +63,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Qwen + Neo4j Graph Memory Agent",
-    version="0.1.0",
-    description="本地 Embedding、Neo4j 图谱/向量记忆与双模型对话服务",
+    title="Qwen + SQLite Memory Agent",
+    version="0.2.0",
+    description="进程内 Embedding、SQLite 分级记忆与双模型对话服务",
     lifespan=lifespan,
 )
 
@@ -96,13 +104,13 @@ async def live() -> dict[str, str]:
 
 @app.get("/health")
 async def health(request: Request) -> dict[str, object]:
-    neo4j_ok = await request.app.state.store.ping()
+    database_ok = await request.app.state.store.ping()
     embedding_ok = await request.app.state.embedding.health()
     llm_configured = bool(settings.ai_base_url and settings.chat_model and settings.memory_model)
     mcp_tools = len(request.app.state.mcp.openai_tools())
     return {
-        "status": "ok" if neo4j_ok and embedding_ok and llm_configured else "degraded",
-        "neo4j": neo4j_ok,
+        "status": "ok" if database_ok and embedding_ok and llm_configured else "degraded",
+        "database": database_ok,
         "embedding": embedding_ok,
         "llm_configured": llm_configured,
         "mcp_tools": mcp_tools,
@@ -151,7 +159,9 @@ async def search_memories(
     limit: int = Query(default=8, ge=1, le=50),
 ) -> list[MemoryView]:
     vector = (await request.app.state.embedding.embed([q], is_query=True))[0]
-    items = await request.app.state.store.search_memories(user_id, vector, limit=limit)
+    items = await request.app.state.store.search_memories(
+        user_id, vector, limit=limit, query_text=q
+    )
     return [MemoryView(**item) for item in items]
 
 
@@ -183,7 +193,7 @@ async def create_memory(
         user_id=body.user_id,
         text=body.text,
         kind=body.kind,
-        importance=body.importance,
+        level=body.level,
         entities=[entity.model_dump() for entity in body.entities],
         embedding=vector,
         source="manual_api",
