@@ -166,8 +166,15 @@ class MemoryStore:
     async def connect(self, attempts: int = 1) -> None:
         def open_db() -> sqlite3.Connection:
             path = Path(self.settings.db_path)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            conn = sqlite3.connect(path, check_same_thread=False)
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                conn = sqlite3.connect(path, check_same_thread=False)
+            except (OSError, sqlite3.OperationalError) as exc:
+                raise RuntimeError(
+                    f"无法打开数据库 {path}：{exc}。若挂载了旧版本（Neo4j 时代）的数据卷，"
+                    "其属主不是本容器的 appuser(uid 10001)，请删除旧卷重建，"
+                    "或 podman unshare chown -R 10001:10001 <卷挂载点>。"
+                ) from exc
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")

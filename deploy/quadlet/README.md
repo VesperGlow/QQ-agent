@@ -39,6 +39,8 @@ curl http://127.0.0.1:9000/healthz
 
 再精简一点的话，env 只需 8 行就能跑：`APP_API_KEY`、`AI_BASE_URL`、`AI_API_KEY`、`MEMORY_MODEL`、`CHAT_MODEL`、`QQ_APP_ID`、`QQ_APP_SECRET`、`QQ_EVENT_MODE=websocket`——存储路径、embedding 模型、记忆等级梯度等全部有代码默认值。
 
+从旧版（Neo4j 时代）升级：`qq-agent-data` 卷的属主是当年的 neo4j 用户，新版应用（uid 10001）写不进去，启动会报 `unable to open database file`。旧数据新版用不上，停服务后 `podman volume rm qq-agent-data` 重建即可；`qq-agent-models` 卷不受影响。
+
 启用 Podman 自带的镜像自动更新定时器：
 
 ```sh
