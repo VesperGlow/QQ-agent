@@ -1,6 +1,7 @@
 # 单一二进制：HTTP API + 进程内 ONNX embedding + SQLite 分级记忆 + QQ 桥接，
 # 全部在一个 Rust 进程里。写完 .env 即可 docker run / compose up。
-FROM rust:1.88-bookworm AS builder
+# rust:1 = 最新 stable；锁文件里的依赖会随更新抬高 rust-version 下限，别钉旧小版本
+FROM rust:1-bookworm AS builder
 
 WORKDIR /src
 
