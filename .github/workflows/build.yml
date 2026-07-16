@@ -41,6 +41,15 @@ jobs:
           RUN_EMBEDDING_SMOKE: "1"
         run: cargo test --locked
 
+      - name: Release build (mirrors the docker build step)
+        run: |
+          set -o pipefail
+          cargo build --release --locked 2>&1 | tee /tmp/build.log || {
+            grep -E "^error" -A6 /tmp/build.log | head -60 | \
+              while IFS= read -r line; do echo "::error::${line}"; done
+            exit 1
+          }
+
       - name: Validate Compose file
         run: |
           cp .env.example .env
