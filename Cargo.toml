@@ -8,7 +8,7 @@ rust-version = "1.85"
 # onnx = 进程内 embedding 推理（ort + tokenizers）。关闭后仅支持
 # EMBEDDING_API_STYLE=openai 远程接口，用于在缺 ONNX 预编译库的平台上编译测试。
 default = ["onnx"]
-onnx = ["dep:ort", "dep:tokenizers"]
+onnx = ["dep:ort", "dep:tokenizers", "dep:memmap2"]
 
 [dependencies]
 anyhow = "1"
@@ -32,6 +32,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 
+memmap2 = { version = "0.9", optional = true }
 ort = { version = "=2.0.0-rc.12", optional = true }
 # unstable_wasm = 纯 Rust 正则引擎（fancy-regex），避免 onig 的 C 依赖
 tokenizers = { version = "0.23", default-features = false, features = ["unstable_wasm"], optional = true }

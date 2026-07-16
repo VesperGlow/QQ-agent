@@ -150,7 +150,8 @@ mod local {
     }
 
     pub struct LocalModel {
-        session: std::sync::Mutex<ort::session::Session>,
+        // InMemorySession 借用 mmap 的模型字节（'static：mmap 有意泄漏、与进程同寿）。
+        session: std::sync::Mutex<ort::session::InMemorySession<'static>>,
         tokenizer: Tokenizer,
         eos_id: Option<u32>,
         output_min: f32,
@@ -194,16 +195,26 @@ mod local {
                 .iter()
                 .find_map(|token| tokenizer.token_to_id(token));
 
-            // 关闭内存 arena：不为峰值长期保留大块内存，激活值用完即还。
+            // mmap 模型文件并让 ORT 直接引用映射内存：权重成为文件页缓存
+            // （内存紧张时可回收，不算硬占用），避免"protobuf 缓冲 + 权重副本"
+            // 双份常驻——2GB 小内存机器的启动 OOM 就是这个瞬时峰值造成的。
+            // 泄漏 mmap 是有意的：模型与进程同生命周期。
+            let file = std::fs::File::open(&model_path)
+                .with_context(|| format!("打开模型文件失败：{}", model_path.display()))?;
+            let mmap: &'static memmap2::Mmap =
+                Box::leak(Box::new(unsafe { memmap2::Mmap::map(&file)? }));
             let session = ort::session::Session::builder()
                 .map_err(ort_err)?
                 .with_intra_threads(cfg.embedding_threads)
                 .map_err(ort_err)?
                 .with_memory_pattern(false)
                 .map_err(ort_err)?
-                .commit_from_file(&model_path)
+                // 不把权重预打包成优化布局的副本，省几百 MB 峰值，推理略慢可接受。
+                .with_config_entry("session.disable_prepacking", "1")
+                .map_err(ort_err)?
+                .commit_from_memory_directly(&mmap[..])
                 .map_err(ort_err)?;
-            tracing::info!("本地 embedding 模型加载完成：{}", model_path.display());
+            tracing::info!("本地 embedding 模型加载完成（mmap）：{}", model_path.display());
             Ok(Arc::new(Self {
                 session: std::sync::Mutex::new(session),
                 tokenizer,
