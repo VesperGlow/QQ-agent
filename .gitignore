@@ -8,3 +8,6 @@ model-cache/
 *.exe
 /qqbot/qqbot
 
+
+# Rust 构建产物
+/target/

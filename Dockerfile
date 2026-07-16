@@ -1,38 +1,38 @@
-# 单一镜像内包含两个进程：AI API（Python，内嵌 SQLite 存储与 ONNX embedding 推理）
-# 与 QQ 桥接（Go）。写完 .env 即可 docker run / compose up，无任何外部服务依赖。
-FROM golang:1.24-alpine AS gobuild
+# 单一二进制：HTTP API + 进程内 ONNX embedding + SQLite 分级记忆 + QQ 桥接，
+# 全部在一个 Rust 进程里。写完 .env 即可 docker run / compose up。
+FROM rust:1.88-bookworm AS builder
 
-ARG GOPROXY=https://goproxy.cn,direct
-ENV GOPROXY=${GOPROXY} CGO_ENABLED=0
 WORKDIR /src
 
-COPY qqbot/go.mod qqbot/go.sum ./
-RUN go mod download
-COPY qqbot/*.go ./
-RUN go test ./... && go build -trimpath -ldflags="-s -w" -o /out/qqbot .
+# 先只拷贝依赖清单构建一次空壳，让依赖编译结果进缓存层。
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src && echo 'fn main() {}' > src/main.rs && \
+    cargo build --release --locked && \
+    rm -rf src
 
-FROM python:3.12-slim
+COPY src ./src
+COPY static ./static
+RUN touch src/main.rs && cargo build --release --locked
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
-    QQ_AI_URL=http://127.0.0.1:8000/v1/chat \
-    HF_HOME=/models
+# ort 若为动态链接会产出 libonnxruntime*.so，收集起来；静态链接时无产物。
+RUN mkdir -p /out/bin /out/lib && \
+    cp target/release/qq-agent /out/bin/ && \
+    (find target/release -maxdepth 4 -name 'libonnxruntime*.so*' -exec cp -a {} /out/lib/ \; || true)
 
-WORKDIR /app
+FROM debian:bookworm-slim
 
-COPY app/requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-COPY app/src ./src
-COPY app/static ./static
-COPY --from=gobuild /out/qqbot /usr/local/bin/qqbot
-COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-
-RUN chmod +x /usr/local/bin/entrypoint.sh && \
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates curl && \
+    rm -rf /var/lib/apt/lists/* && \
     useradd --create-home --uid 10001 appuser && \
     mkdir -p /data /models && \
-    chown -R appuser:appuser /app /data /models
+    chown appuser:appuser /data /models
+
+COPY --from=builder /out/bin/qq-agent /usr/local/bin/qq-agent
+COPY --from=builder /out/lib/ /usr/local/lib/
+
+ENV HF_HOME=/models \
+    LD_LIBRARY_PATH=/usr/local/lib
 
 USER appuser
 
@@ -40,4 +40,4 @@ USER appuser
 VOLUME /data /models
 
 EXPOSE 8000 9000
-CMD ["entrypoint.sh"]
+CMD ["qq-agent"]

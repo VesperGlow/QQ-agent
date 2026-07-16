@@ -12,48 +12,34 @@ permissions:
 
 jobs:
   test:
-    name: Test Python and Go
+    name: Test Rust binary
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: app/requirements-dev.txt
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
 
-      - name: Install Python dependencies
-        run: python -m pip install -r app/requirements-dev.txt
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Unit tests (no model)
+        run: cargo test --no-default-features --locked
 
       - name: Cache embedding model
         uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface
-          key: embedding-model-${{ hashFiles('app/src/config.py') }}
-          restore-keys: embedding-model-
+          key: embedding-model-rust-${{ hashFiles('src/config.rs') }}
+          restore-keys: |
+            embedding-model-rust-
+            embedding-model-
 
-      - name: Test Python service (incl. real-model embedding smoke)
+      - name: Full tests incl. real-model embedding smoke
         env:
-          PYTHONPATH: ${{ github.workspace }}/app
           RUN_EMBEDDING_SMOKE: "1"
-        run: python -m pytest -q
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: "1.24.x"
-          cache-dependency-path: qqbot/go.sum
-
-      - name: Test QQ bridge
-        working-directory: qqbot
-        run: go test -race ./...
-
-      - name: Vet QQ bridge
-        working-directory: qqbot
-        run: go vet ./...
+        run: cargo test --locked
 
       - name: Validate Compose file
         run: |
@@ -95,6 +81,5 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.title=QQ Agent
-          build-args: GOPROXY=https://proxy.golang.org,direct
-          cache-from: type=gha,scope=combined
-          cache-to: type=gha,mode=max,scope=combined
+          cache-from: type=gha,scope=rust
+          cache-to: type=gha,mode=max,scope=rust

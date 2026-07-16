@@ -12,7 +12,7 @@ Volume=qq-agent-models:/models
 # embedding 权重约 650MB 常驻，稳态总占用 ~1GB；上限兜底 2GB。
 PodmanArgs=--memory=2g
 AutoUpdate=registry
-HealthCmd=python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/live', timeout=3); urllib.request.urlopen('http://127.0.0.1:9000/healthz', timeout=3)"
+HealthCmd=curl -fsS http://127.0.0.1:8000/health/live >/dev/null && curl -fsS http://127.0.0.1:9000/healthz >/dev/null
 HealthInterval=15s
 HealthRetries=5
 # 首次启动要下载 embedding 模型（约 640MB），给足冷启动时间。

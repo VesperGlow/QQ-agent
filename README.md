@@ -2,7 +2,7 @@
 
 [![Build and test](https://github.com/VesperGlow/QQ-agent/actions/workflows/build.yml/badge.svg)](https://github.com/VesperGlow/QQ-agent/actions/workflows/build.yml)
 
-这是一个可直接容器化部署的个人情感陪伴助手：进程内跑 uint8 量化的 `Qwen3-Embedding-0.6B`（ONNX）做向量化，SQLite 单文件保存对话、分级记忆与情绪时间线；便宜模型给每条候选记忆评定 0..10 的记忆等级并抽取情绪，主模型负责对话与工具调用；腾讯官方 BotGo 桥接负责与 QQ 私聊（C2C）通信。全部打包在**同一个镜像**里（稳态内存约 1GB），填好 `.env` 一条命令即可启动。
+这是一个可直接容器化部署的个人情感陪伴助手：**一个 Rust 单二进制**（axum + rusqlite + ort）内完成一切——进程内跑 uint8 量化的 `Qwen3-Embedding-0.6B`（ONNX）做向量化，SQLite 单文件保存对话、分级记忆与情绪时间线；便宜模型给每条候选记忆评定 0..10 的记忆等级并抽取情绪，主模型负责对话与工具调用；QQ 桥接按官方开放平台协议与私聊（C2C）通信。填好 `.env` 一条命令即可启动，稳态内存 1GB 以内。
 
 ```mermaid
 flowchart LR
@@ -15,7 +15,7 @@ flowchart LR
     L -->|记忆工具 + MCP 外部工具| A
     M["远程 MCP: Tavily/Firecrawl"] <-->|联网搜索/抓取| L
     N -->|相似度+等级+新近度加权检索| A
-    Q[QQ 用户] <-->|WebSocket / HTTPS Webhook| B[BotGo 桥接]
+    Q[QQ 用户] <-->|WebSocket / HTTPS Webhook| B[QQ 桥接]
     B -->|内部 /v1/chat| A
     B -->|被动回复| Q
 ```
@@ -206,7 +206,7 @@ docker compose logs --tail=200 agent
 
 ## 接入 QQ 机器人
 
-本项目使用腾讯官方 `tencent-connect/botgo` v0.2.1，自动用 `AppID + AppSecret` 获取并刷新 Access Token，并可通过 `QQ_EVENT_MODE` 在 WebSocket 与 HTTPS Webhook 之间切换。
+QQ 桥接按腾讯官方开放平台协议实现（与 `tencent-connect/botgo` 行为对齐），自动用 `AppID + AppSecret` 获取并刷新 Access Token，并可通过 `QQ_EVENT_MODE` 在 WebSocket 与 HTTPS Webhook 之间切换。
 
 1. 在 [QQ 开放平台](https://q.qq.com/) 创建机器人，把 `AppID` 和 `AppSecret` 写入 `.env`。
 2. 使用 WebSocket 时设置以下变量。它由容器主动连接 QQ，不需要公网域名或反向代理：
@@ -226,7 +226,7 @@ docker compose logs --tail=200 agent
    }
    ```
 
-4. Webhook 模式下，在 QQ 开放平台把回调地址配置为 `https://你的域名/qqbot`。平台会发起签名校验，BotGo 会自动完成响应。
+4. Webhook 模式下，在 QQ 开放平台把回调地址配置为 `https://你的域名/qqbot`。平台会发起签名校验，服务会自动完成响应。
 5. 本项目仅订阅私聊事件 `C2C_MESSAGE_CREATE`（个人情感陪伴定位，不处理群聊与频道）。
 
 6. 把 VPS 的固定公网出口 IP 加入机器人 IP 白名单；机器人上线前，在开放平台配置沙箱成员。
@@ -243,7 +243,7 @@ Webhook 收到事件后会立即确认，再异步调用 AI，避免慢模型触
 
 ## GHCR 镜像
 
-`main` 分支通过测试后，GitHub Actions 会发布一个 `linux/amd64` 镜像（AI API 内嵌 SQLite 存储与 ONNX embedding，与 QQ 桥接同镜像）：
+`main` 分支通过测试后，GitHub Actions 会发布一个 `linux/amd64` 镜像（单个 Rust 二进制，包含 API、embedding、存储与 QQ 桥接）：
 
 ```text
 ghcr.io/vesperglow/qq-agent:latest

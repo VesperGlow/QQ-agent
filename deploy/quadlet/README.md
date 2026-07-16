@@ -1,6 +1,6 @@
 # 最小 Podman Quadlet 部署
 
-这份 `qq-agent.container` 运行 GHCR 中的合并镜像——AI API（内嵌 SQLite 存储与进程内 ONNX embedding）与 QQ BotGo 桥接同在一个容器内，不需要任何外部服务。数据保存在 `qq-agent-data`（SQLite）、`qq-agent-models`（模型缓存）两个卷里。
+这份 `qq-agent.container` 运行 GHCR 中的镜像——单个 Rust 二进制包含 AI API、进程内 ONNX embedding、SQLite 分级记忆与 QQ 桥接，不需要任何外部服务。数据保存在 `qq-agent-data`（SQLite）、`qq-agent-models`（模型缓存）两个卷里。
 
 ## Rootless 安装
 

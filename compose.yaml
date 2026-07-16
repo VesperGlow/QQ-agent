@@ -1,18 +1,16 @@
 name: memory-graph-agent
 
-# 单容器部署：AI API（内嵌 SQLite 与 ONNX embedding）+ QQ 桥接同在一个镜像里，
-# 只需填好 .env 即可启动。
+# 单容器单进程部署：Rust 二进制内含 HTTP API、进程内 ONNX embedding、
+# SQLite 分级记忆与 QQ 桥接，只需填好 .env 即可启动。
 services:
   agent:
     image: ${APP_IMAGE:-ghcr.io/vesperglow/qq-agent:latest}
     build:
       context: .
-      args:
-        GOPROXY: ${GO_PROXY:-https://goproxy.cn,direct}
     restart: unless-stopped
     env_file:
       - .env
-    # embedding 权重约 650MB 常驻，稳态总占用 ~1GB；上限兜底 2GB。
+    # embedding 权重约 650MB 常驻，稳态总占用 <1GB；上限兜底 2GB。
     mem_limit: ${MEM_LIMIT:-2g}
     ports:
       - "${APP_BIND_IP:-127.0.0.1}:${APP_PORT:-8000}:8000"
@@ -22,10 +20,10 @@ services:
       - model_cache:/models
     healthcheck:
       test:
-        - CMD
-        - python
-        - -c
-        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/live', timeout=3); urllib.request.urlopen('http://localhost:9000/healthz', timeout=3)"
+        - CMD-SHELL
+        - >-
+          curl -fsS http://localhost:8000/health/live >/dev/null &&
+          curl -fsS http://localhost:9000/healthz >/dev/null
       interval: 15s
       timeout: 5s
       retries: 5
