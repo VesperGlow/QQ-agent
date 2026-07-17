@@ -185,6 +185,7 @@ MCP_SERVERS_JSON=[{"name":"tavily","url":"https://mcp.tavily.com/mcp/?tavilyApiK
 
 - CPU 部署：2 核、2 GB RAM 即可跑（uint8 量化权重约 650MB 常驻，稳态总占用约 1GB，compose 默认 `mem_limit: 2g` 兜底）；内存更紧可调低 `EMBEDDING_CONTEXT_SIZE`。
 - 磁盘：建议预留 2–3 GB 给镜像、模型缓存和数据库。
+- **怎么看内存水位**：模型权重是 mmap 的文件页缓存，内存紧张时内核可直接回收，不是硬占用——所以 `docker stats` / RSS 显示的数字会明显偏大。判断真实水位看匿名内存：`cat /proc/<pid>/smaps_rollup` 里的 `Anonymous` 行（容器内 pid 1），或 cgroup 的 `memory.stat` 里 `anon` 项。给 `mem_limit` 定值时按匿名内存 + 少量余量即可，不必为页缓存留满 650MB。
 - 不想在本机跑推理时，设 `EMBEDDING_API_STYLE=openai` 用供应商的 embedding 接口（注意换模型/维度需重建已有记忆向量）。
 
 ## 备份与更新

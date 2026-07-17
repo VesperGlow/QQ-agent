@@ -271,6 +271,8 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        // 页缓存默认约 2MB；个人库读写量小，512KB 足够（负值单位为 KiB）。
+        conn.pragma_update(None, "cache_size", -512)?;
         conn.execute_batch(SCHEMA)?;
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),

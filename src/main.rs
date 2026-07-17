@@ -13,7 +13,9 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
-#[tokio::main]
+// 异步任务都很轻（推理、SQLite 等重活全在 spawn_blocking 线程池里），
+// 2 个 worker 足够，不必按核数起线程。
+#[tokio::main(worker_threads = 2)]
 async fn main() -> Result<()> {
     let cfg = Arc::new(config::Config::from_env()?);
     let level = cfg.log_level.to_lowercase();

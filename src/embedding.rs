@@ -122,18 +122,24 @@ async fn ensure_model_files(cfg: &Config) -> Result<PathBuf> {
             continue;
         }
         tracing::info!("下载 {name} ...");
-        let bytes = auth(client.get(format!(
+        // 流式落盘：模型文件可达数百 MB，整块读进内存再写盘会造成
+        // 首次启动的瞬时内存峰值，小内存机器会被 OOM。
+        use tokio::io::AsyncWriteExt;
+        let mut response = auth(client.get(format!(
             "https://huggingface.co/{}/resolve/main/{name}",
             cfg.embedding_model
         )))
         .send()
         .await?
         .error_for_status()
-        .with_context(|| format!("下载 {name} 失败"))?
-        .bytes()
-        .await?;
+        .with_context(|| format!("下载 {name} 失败"))?;
         let tmp = target.join(format!("{name}.part"));
-        tokio::fs::write(&tmp, &bytes).await?;
+        let mut file = tokio::fs::File::create(&tmp).await?;
+        while let Some(chunk) = response.chunk().await? {
+            file.write_all(&chunk).await?;
+        }
+        file.flush().await?;
+        drop(file);
         tokio::fs::rename(&tmp, &path).await?;
     }
     Ok(target)
@@ -259,29 +265,34 @@ mod local {
                 };
                 feeds.push((name.clone(), tensor.map_err(ort_err)?.into_dyn()));
             }
-            let outputs = session.run(feeds).map_err(ort_err)?;
+            // 每次 run 后收缩 CPU arena：arena 默认只涨不还，进程 RSS 会永久停在
+            // 历史最长输入的激活峰值上。推理本就串行（infer_lock），收缩没有并发复用损失。
+            let mut run_options = ort::session::RunOptions::new().map_err(ort_err)?;
+            run_options
+                .add_config_entry("memory.enable_memory_arena_shrinkage", "cpu:0")
+                .map_err(ort_err)?;
+            let outputs = session.run_with_options(feeds, &run_options).map_err(ort_err)?;
             let output = &outputs[0];
 
             // 输出可能是 [batch, dim]（图内已池化）或 [batch, seq, dim]（需取最后 token）；
-            // dtype 可能是 uint8（量化输出）或 float32。
-            let (vector, dims): (Vec<f32>, Vec<i64>) =
-                if let Ok((shape, data)) = output.try_extract_tensor::<u8>() {
-                    (
-                        dequantize(data, self.output_min, self.output_max),
-                        shape.to_vec(),
-                    )
-                } else {
-                    let (shape, data) = output.try_extract_tensor::<f32>().map_err(ort_err)?;
-                    (data.to_vec(), shape.to_vec())
-                };
-            let hidden = match dims.as_slice() {
-                [_, dim] => vector[..*dim as usize].to_vec(),
-                [_, seq, dim] => {
-                    let (seq, dim) = (*seq as usize, *dim as usize);
-                    let start = (seq - 1) * dim;
-                    vector[start..start + dim].to_vec()
+            // dtype 可能是 uint8（量化输出）或 float32。只转换需要的那一段，
+            // 免得先把整个 [1, seq, dim] 拷成 Vec 再切片。
+            let last_token = |dims: &[i64]| -> Result<std::ops::Range<usize>> {
+                match dims {
+                    [_, dim] => Ok(0..*dim as usize),
+                    [_, seq, dim] => {
+                        let (seq, dim) = (*seq as usize, *dim as usize);
+                        Ok((seq - 1) * dim..seq * dim)
+                    }
+                    other => bail!("无法理解的 embedding 输出形状：{other:?}"),
                 }
-                other => bail!("无法理解的 embedding 输出形状：{other:?}"),
+            };
+            let hidden: Vec<f32> = if let Ok((shape, data)) = output.try_extract_tensor::<u8>() {
+                let range = last_token(&shape.to_vec())?;
+                dequantize(&data[range], self.output_min, self.output_max)
+            } else {
+                let (shape, data) = output.try_extract_tensor::<f32>().map_err(ort_err)?;
+                data[last_token(&shape.to_vec())?].to_vec()
             };
             Ok(hidden)
         }
