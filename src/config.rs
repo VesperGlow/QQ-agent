@@ -4,6 +4,9 @@ use std::env;
 
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
+use serde_json::{Map, Value};
+
+use crate::llm::Think;
 
 fn env_string(name: &str, fallback: &str) -> String {
     match env::var(name) {
@@ -117,6 +120,12 @@ pub struct Config {
     pub ai_timeout_seconds: f64,
     pub ai_max_retries: u32,
     pub ai_extra_headers: Vec<(String, String)>,
+    /// 对话调用的思考深度；配 ai_thinking_map 翻译成具体厂商字段。
+    pub chat_think: Think,
+    /// 「思考等级 → 要合并进请求体的 JSON 片段」映射，对话/记忆两个接入点各一份。
+    /// 记忆侧调用（判定、摘要）恒为 off，一般无需配 memory 映射。
+    pub ai_thinking_map: Map<String, Value>,
+    pub memory_thinking_map: Map<String, Value>,
     pub chat_max_output_tokens: u32,
     pub memory_max_output_tokens: u32,
     pub max_tool_rounds: u32,
@@ -228,6 +237,20 @@ impl Config {
             _ => ai_extra_headers.clone(),
         };
 
+        let chat_think = {
+            let raw = env_string("CHAT_THINK", "high");
+            Think::parse(&raw)
+                .with_context(|| format!("CHAT_THINK 只能是 off/low/medium/high，当前是 {raw}"))?
+        };
+        let ai_thinking_map = parse_thinking_map(&env_string("AI_THINKING_MAP_JSON", "{}"))
+            .context("AI_THINKING_MAP_JSON 必须是 {等级: {字段片段}} 形式的 JSON")?;
+        // 未单独设置记忆映射时，与接入点回退逻辑一致：沿用对话侧映射。
+        let memory_thinking_map = match env::var("MEMORY_THINKING_MAP_JSON") {
+            Ok(value) if !value.trim().is_empty() => parse_thinking_map(&value)
+                .context("MEMORY_THINKING_MAP_JSON 必须是 {等级: {字段片段}} 形式的 JSON")?,
+            _ => ai_thinking_map.clone(),
+        };
+
         let embedding_api_style = match env_string("EMBEDDING_API_STYLE", "local").as_str() {
             "local" => EmbeddingStyle::Local,
             "openai" => EmbeddingStyle::OpenAi,
@@ -271,6 +294,9 @@ impl Config {
             ai_timeout_seconds: env_parse("AI_TIMEOUT_SECONDS", 120.0),
             ai_max_retries: env_parse("AI_MAX_RETRIES", 2),
             ai_extra_headers,
+            chat_think,
+            ai_thinking_map,
+            memory_thinking_map,
             chat_max_output_tokens: env_parse("CHAT_MAX_OUTPUT_TOKENS", 2048),
             memory_max_output_tokens: env_parse("MEMORY_MAX_OUTPUT_TOKENS", 800),
             max_tool_rounds: env_parse("MAX_TOOL_ROUNDS", 6),
@@ -370,6 +396,8 @@ impl Config {
             memory_base_url: &'a str,
             memory_model: &'a str,
             chat_model: &'a str,
+            chat_think: &'a str,
+            chat_thinking_levels: Vec<&'a str>,
             embedding_api_style: &'a str,
             embedding_model: &'a str,
             embedding_dimensions: usize,
@@ -383,6 +411,8 @@ impl Config {
             memory_base_url: &self.memory_base_url,
             memory_model: &self.memory_model,
             chat_model: &self.chat_model,
+            chat_think: self.chat_think.key(),
+            chat_thinking_levels: self.ai_thinking_map.keys().map(String::as_str).collect(),
             embedding_api_style: match self.embedding_api_style {
                 EmbeddingStyle::Local => "local",
                 EmbeddingStyle::OpenAi => "openai",
@@ -408,6 +438,28 @@ fn parse_headers(raw: &str) -> Result<Vec<(String, String)>> {
             (k.clone(), text)
         })
         .collect())
+}
+
+/// 解析 *_THINKING_MAP_JSON：形如 {"high": {"reasoning_effort": "high"}, ...}。
+/// 顶层 key 必须是合法思考等级（off/low/medium/high 或其别名，归一化到标准 key），
+/// 对应的值必须是对象（要合并进请求体的字段片段）。
+fn parse_thinking_map(raw: &str) -> Result<Map<String, Value>> {
+    let value: Value = serde_json::from_str(if raw.trim().is_empty() { "{}" } else { raw })
+        .context("必须是合法 JSON")?;
+    let object = value.as_object().context("需要 JSON 对象")?;
+    let mut map = Map::new();
+    for (key, fragment) in object {
+        let level = Think::parse(key)
+            .with_context(|| format!("未知的思考等级 key：{key}（应为 off/low/medium/high）"))?;
+        if !fragment.is_object() {
+            bail!("思考等级 {key} 的值必须是对象，例如 {{\"reasoning_effort\": \"high\"}}");
+        }
+        // 归一化到标准 key，别名（none/minimal/max…）不至于查不到。
+        if map.insert(level.key().to_string(), fragment.clone()).is_some() {
+            bail!("思考等级 {} 被重复定义（注意别名会归一）", level.key());
+        }
+    }
+    Ok(map)
 }
 
 fn parse_mcp_servers(raw: &str) -> Result<Vec<McpServer>> {

@@ -46,12 +46,49 @@ pub struct LlmResponse {
     pub usage: TokenUsage,
 }
 
+/// 抽象的「思考深度」等级。领域层只认这四档语义值，各家厂商用什么字段表达
+/// （reasoning_effort / enable_thinking / thinking.budget_tokens / …）完全由配置里的
+/// 「等级 → payload 片段」映射决定，见 Config::*_thinking_map 与 chat() 里的 deep-merge。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Think {
+    #[default]
+    Off,
+    Low,
+    Medium,
+    High,
+}
+
+impl Think {
+    /// 在 *_THINKING_MAP_JSON 里查片段用的 key。
+    pub fn key(self) -> &'static str {
+        match self {
+            Think::Off => "off",
+            Think::Low => "low",
+            Think::Medium => "medium",
+            Think::High => "high",
+        }
+    }
+
+    /// 解析 env 值；接受常见别名。未知值返回 None，由调用方决定是否报错。
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_lowercase().as_str() {
+            "off" | "none" | "no" | "false" | "0" => Some(Think::Off),
+            "low" | "minimal" | "min" => Some(Think::Low),
+            "medium" | "med" | "mid" => Some(Think::Medium),
+            "high" | "max" => Some(Think::High),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ChatParams {
     pub temperature: f32,
     pub max_tokens: u32,
     pub tools: Option<Vec<Value>>,
     pub response_format: Option<Value>,
+    /// 思考深度；配合当前 Profile 的 thinking_map 翻译成具体厂商字段。
+    pub think: Think,
 }
 
 /// 选择使用哪个模型接入点：对话（grok 等）或记忆（deepseek 等）。
@@ -67,6 +104,8 @@ struct Endpoint<'a> {
     base_url: &'a str,
     api_key: &'a str,
     extra_headers: &'a [(String, String)],
+    /// 「思考等级 → 要合并进 payload 的 JSON 片段」。厂商差异全部落在这里。
+    thinking_map: &'a serde_json::Map<String, Value>,
 }
 
 pub struct LlmClient {
@@ -91,12 +130,14 @@ impl LlmClient {
                 base_url: &self.cfg.ai_base_url,
                 api_key: &self.cfg.ai_api_key,
                 extra_headers: &self.cfg.ai_extra_headers,
+                thinking_map: &self.cfg.ai_thinking_map,
             },
             Profile::Memory => Endpoint {
                 model: &self.cfg.memory_model,
                 base_url: &self.cfg.memory_base_url,
                 api_key: &self.cfg.memory_api_key,
                 extra_headers: &self.cfg.memory_extra_headers,
+                thinking_map: &self.cfg.memory_thinking_map,
             },
         }
     }
@@ -135,6 +176,11 @@ impl LlmClient {
         }
         if let Some(format) = &params.response_format {
             payload["response_format"] = format.clone();
+        }
+        // 思考深度：把当前等级对应的厂商片段深合并进 payload。片段里值为 null 的键会被
+        // 删除（用于去掉某些推理模型不接受的字段，如 o 系的 temperature、grok 的 stop）。
+        if let Some(fragment) = endpoint.thinking_map.get(params.think.key()) {
+            deep_merge(&mut payload, fragment);
         }
         let url = Self::url(endpoint.base_url)?;
         let started = std::time::Instant::now();
@@ -202,6 +248,23 @@ impl LlmClient {
     }
 }
 
+/// 把 `src` 递归合并进 `dst`：对象逐键合并，其余类型整体覆盖。
+/// 约定：`src` 里值为 null 的键表示「从 dst 删除该键」，而不是写入 null。
+fn deep_merge(dst: &mut Value, src: &Value) {
+    match (dst, src) {
+        (Value::Object(d), Value::Object(s)) => {
+            for (key, value) in s {
+                if value.is_null() {
+                    d.remove(key);
+                } else {
+                    deep_merge(d.entry(key.clone()).or_insert(Value::Null), value);
+                }
+            }
+        }
+        (slot, value) => *slot = value.clone(),
+    }
+}
+
 fn parse_choice(data: &Value) -> Result<LlmResponse, LlmError> {
     let message = data["choices"]
         .as_array()
@@ -249,6 +312,40 @@ mod tests {
             {"type": "text", "text": "你"}, {"type": "text", "text": "好"}
         ]}}]});
         assert_eq!(parse_choice(&data).unwrap().content, "你好");
+    }
+
+    #[test]
+    fn deep_merge_adds_and_overwrites() {
+        let mut base = json!({"model": "m", "temperature": 0.3});
+        deep_merge(&mut base, &json!({"reasoning_effort": "high", "temperature": 0.9}));
+        assert_eq!(base["reasoning_effort"], json!("high"));
+        assert_eq!(base["temperature"], json!(0.9));
+        assert_eq!(base["model"], json!("m"));
+    }
+
+    #[test]
+    fn deep_merge_null_deletes_key() {
+        let mut base = json!({"temperature": 0.3, "stop": ["x"]});
+        deep_merge(&mut base, &json!({"reasoning_effort": "high", "temperature": null}));
+        assert!(base.get("temperature").is_none());
+        assert_eq!(base["reasoning_effort"], json!("high"));
+        assert_eq!(base["stop"], json!(["x"]));
+    }
+
+    #[test]
+    fn deep_merge_is_recursive() {
+        let mut base = json!({"thinking": {"type": "enabled"}});
+        deep_merge(&mut base, &json!({"thinking": {"budget_tokens": 8000}}));
+        assert_eq!(base["thinking"]["type"], json!("enabled"));
+        assert_eq!(base["thinking"]["budget_tokens"], json!(8000));
+    }
+
+    #[test]
+    fn think_parse_aliases() {
+        assert_eq!(Think::parse("none"), Some(Think::Off));
+        assert_eq!(Think::parse("HIGH"), Some(Think::High));
+        assert_eq!(Think::parse(" med "), Some(Think::Medium));
+        assert_eq!(Think::parse("banana"), None);
     }
 
     #[test]

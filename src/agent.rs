@@ -850,6 +850,7 @@ impl Agent {
                 temperature: 0.3,
                 max_tokens: self.cfg.chat_max_output_tokens,
                 tools: tools_enabled.then(|| available_tools.clone()),
+                think: self.cfg.chat_think,
                 ..Default::default()
             };
             let response = match self.llm.chat(Profile::Chat, &messages, params).await {
