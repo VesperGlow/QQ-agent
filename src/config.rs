@@ -125,6 +125,12 @@ pub struct Config {
     pub mcp_timeout_seconds: f64,
     pub mcp_result_max_chars: usize,
 
+    /// 内置网页抓取工具（fetch_url）：拉取公开链接抽正文转 Markdown，不渲染 JS。
+    pub fetch_url_enabled: bool,
+    pub fetch_timeout_seconds: f64,
+    pub fetch_max_bytes: usize,
+    pub fetch_result_max_chars: usize,
+
     pub db_path: String,
 
     pub embedding_api_style: EmbeddingStyle,
@@ -274,6 +280,11 @@ impl Config {
             mcp_servers,
             mcp_timeout_seconds: env_parse("MCP_TIMEOUT_SECONDS", 300.0),
             mcp_result_max_chars: env_parse("MCP_RESULT_MAX_CHARS", 12000),
+
+            fetch_url_enabled: env_bool("FETCH_URL_ENABLED", true),
+            fetch_timeout_seconds: env_parse("FETCH_TIMEOUT_SECONDS", 30.0),
+            fetch_max_bytes: clamp(env_parse("FETCH_MAX_BYTES", 5_242_880), 65_536, 52_428_800),
+            fetch_result_max_chars: clamp(env_parse("FETCH_RESULT_MAX_CHARS", 12000), 500, 60000),
 
             db_path: env_string("DB_PATH", "/data/memory.db"),
 

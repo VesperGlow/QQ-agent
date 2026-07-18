@@ -24,7 +24,10 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 rand = "0.9"
 regex = "1"
 thiserror = "2"
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "http2"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "http2", "stream"] }
+# 网页正文抽取（readability 移植）+ HTML 转 Markdown，供内置 fetch_url 工具用，纯 Rust 无 C 依赖。
+dom_smoothie = "0.18"
+htmd = "0.5"
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 use crate::config::Config;
 use crate::embedding::Embedder;
+use crate::fetch::Fetcher;
 use crate::llm::{ChatParams, LlmClient, LlmError, Profile, TokenUsage};
 use crate::mcp::McpManager;
 use crate::shutdown::Pending;
@@ -252,6 +253,17 @@ fn builtin_tools() -> Vec<Value> {
     ]
 }
 
+/// 内置网页抓取工具。取一个公开链接的正文（静态/SSR 页面），不渲染 JS。
+fn fetch_url_tool() -> Value {
+    json!({"type": "function", "function": {
+        "name": "fetch_url",
+        "description": "抓取一个公开网页链接并返回其正文（已抽取主体、转成简洁文本）。当用户给出链接、或需要查看某个网址的内容时使用。只支持静态/服务端渲染的页面（新闻、博客、文档、GitHub 等），不执行页面 JS；无法用于搜索引擎结果页或需要登录的内容。",
+        "parameters": {"type": "object", "properties": {
+            "url": {"type": "string", "description": "要抓取的完整 http/https 链接"}
+        }, "required": ["url"]},
+    }})
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AgentResult {
     pub conversation_id: String,
@@ -282,6 +294,7 @@ pub struct Agent {
     embedding: Arc<Embedder>,
     llm: Arc<LlmClient>,
     mcp: Arc<McpManager>,
+    fetcher: Arc<Fetcher>,
     pending: Pending,
 }
 
@@ -292,6 +305,7 @@ impl Agent {
         embedding: Arc<Embedder>,
         llm: Arc<LlmClient>,
         mcp: Arc<McpManager>,
+        fetcher: Arc<Fetcher>,
         pending: Pending,
     ) -> Self {
         Self {
@@ -300,6 +314,7 @@ impl Agent {
             embedding,
             llm,
             mcp,
+            fetcher,
             pending,
         }
     }
@@ -830,6 +845,9 @@ impl Agent {
         let mut usage = TokenUsage::default();
         let mut tools_enabled = true;
         let mut available_tools = builtin_tools();
+        if self.cfg.fetch_url_enabled {
+            available_tools.push(fetch_url_tool());
+        }
         if self.mcp.enabled() {
             available_tools.extend(self.mcp.openai_tools().iter().cloned());
         }
@@ -941,6 +959,16 @@ impl Agent {
             return self.mcp.call(name, arguments).await;
         }
         match name {
+            "fetch_url" => {
+                if !self.cfg.fetch_url_enabled {
+                    bail!("fetch_url 工具未启用");
+                }
+                let url = arguments["url"].as_str().unwrap_or("").trim();
+                if url.is_empty() {
+                    bail!("url 不能为空");
+                }
+                self.fetcher.fetch(url).await
+            }
             "search_memories" => {
                 let query = arguments["query"].as_str().unwrap_or("").trim().to_string();
                 if query.is_empty() {

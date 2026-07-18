@@ -4,6 +4,7 @@ mod agent;
 mod api;
 mod config;
 mod embedding;
+mod fetch;
 mod image;
 mod llm;
 mod mcp;
@@ -40,12 +41,18 @@ async fn main() -> Result<()> {
     let llm = Arc::new(llm::LlmClient::new(cfg.clone())?);
     let mut mcp = mcp::McpManager::new(cfg.clone())?;
     mcp.start().await?;
+    let fetcher = Arc::new(fetch::Fetcher::new(
+        cfg.fetch_timeout_seconds,
+        cfg.fetch_max_bytes,
+        cfg.fetch_result_max_chars,
+    )?);
     let agent = agent::Agent::new(
         cfg.clone(),
         store.clone(),
         embedder.clone(),
         llm,
         Arc::new(mcp),
+        fetcher,
         pending.clone(),
     );
 
