@@ -1,13 +1,5 @@
 .env
-__pycache__/
-.pytest_cache/
-*.py[cod]
-neo4j-data/
 model-cache/
-# Go 本地构建产物
-*.exe
-/qqbot/qqbot
-
 
 # Rust 构建产物
 /target/

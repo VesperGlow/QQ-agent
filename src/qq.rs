@@ -1,6 +1,6 @@
-//! QQ 桥接：官方开放平台协议的 Rust 实现（原 Go/botgo 版的移植）。
+//! QQ 桥接：官方开放平台协议的 Rust 实现。
 //! 支持 WebSocket 与 HTTPS Webhook 两种事件模式，仅处理私聊 C2C。
-//! AI 调用直接走进程内 Agent，不再经 HTTP 回环。
+//! AI 调用直接走进程内 Agent，不经 HTTP 回环。
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -23,7 +23,7 @@ use crate::shutdown::{Listener, Pending};
 
 const TOKEN_URL: &str = "https://bots.qq.com/app/getAppAccessToken";
 const API_BASE: &str = "https://api.sgroup.qq.com";
-/// 群/C2C 消息事件的 intent 位（botgo IntentGroupMessages）。
+/// 群/C2C 消息事件的 intent 位（官方 IntentGroupMessages）。
 const INTENT_GROUP_AND_C2C: u64 = 1 << 25;
 
 // WS / Webhook 操作码（与官方协议一致）
@@ -38,7 +38,7 @@ const OP_HEARTBEAT_ACK: i64 = 11;
 const OP_CALLBACK_ACK: i64 = 12;
 const OP_CALLBACK_VALIDATION: i64 = 13;
 
-/// 与 botgo 相同的 ed25519 seed 派生：secret 自倍增到 >=32 字节后截断。
+/// 官方约定的 ed25519 seed 派生：secret 自倍增到 >=32 字节后截断。
 fn signing_key(secret: &str) -> Result<ed25519_dalek::SigningKey> {
     if secret.is_empty() {
         bail!("QQ_APP_SECRET 为空");
@@ -60,7 +60,7 @@ fn verify_signature(secret: &str, timestamp: &str, body: &[u8], signature_hex: &
     key.verifying_key().verify(&message, &signature).is_ok()
 }
 
-/// 长回复分片：与 Go 版 splitMessage 行为一致（前缀 (i/n)、超容截断标记）。
+/// 长回复分片：加 (i/n) 前缀，超容时打截断标记。
 pub fn split_message(text: &str, max_runes: usize, max_parts: usize) -> Vec<String> {
     let text = text.trim();
     if text.is_empty() {
@@ -98,11 +98,6 @@ pub fn stable_ids(sender_id: &str) -> (String, String) {
         format!("qq:c2c:{}", hex::encode(&user_hash[..16])),
         format!("qqc:c2c:{}", hex::encode(&convo_hash[..16])),
     )
-}
-
-fn sanitize_utf8(value: &str) -> String {
-    // serde_json 解析出的字符串必为合法 UTF-8，这里只做占位对齐 Go 版行为。
-    value.to_string()
 }
 
 #[derive(Debug, Clone)]
@@ -283,31 +278,37 @@ impl QqBridge {
         }))
     }
 
-    /// 启动 worker、HTTP 监听（healthz + 可选 webhook）、以及 websocket 模式下的网关连接。
+    /// 启动消息派发、HTTP 监听（healthz + 可选 webhook）、以及 websocket 模式下的网关连接。
     pub async fn run(self: Arc<Self>) -> Result<()> {
-        // worker 池：从队列取消息、按会话互斥处理。
-        let receiver = self
+        // 单派发循环：从队列取消息，用信号量把并发处理数限制在 qq_workers，
+        // 每条消息按会话互斥处理。比多个 worker 抢同一个 receiver 更直观。
+        let mut receiver = self
             .jobs_rx
             .lock()
             .unwrap()
             .take()
             .ok_or_else(|| anyhow!("QQ 桥接重复启动"))?;
-        let receiver = Arc::new(tokio::sync::Mutex::new(receiver));
-        for _ in 0..self.cfg.qq_workers {
+        {
             let bridge = self.clone();
-            let receiver = receiver.clone();
+            let permits = Arc::new(tokio::sync::Semaphore::new(self.cfg.qq_workers));
             tokio::spawn(async move {
                 loop {
-                    // 停机信号后不再取新消息；正在处理的消息由 pending guard
+                    // 停机信号后不再取新消息；已在处理的消息由 pending guard
                     // 保护，main 会等它连同回复一起做完。
                     let job = tokio::select! {
-                        job = async { receiver.lock().await.recv().await } => job,
+                        job = receiver.recv() => job,
                         _ = bridge.shutdown.clone().wait() => break,
                     };
                     let Some(job) = job else { break };
-                    let _pending = bridge.pending.guard();
-                    let _guard = bridge.locks.lock(&job.conversation_id).await;
-                    bridge.process(job).await;
+                    // 满并发时在此背压，直到腾出处理槽位。
+                    let Ok(permit) = permits.clone().acquire_owned().await else { break };
+                    let bridge = bridge.clone();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        let _pending = bridge.pending.guard();
+                        let _guard = bridge.locks.lock(&job.conversation_id).await;
+                        bridge.process(job).await;
+                    });
                 }
             });
         }
@@ -518,7 +519,7 @@ impl QqBridge {
             .trim()
             .to_string();
         let message_id = data["id"].as_str().unwrap_or("").trim().to_string();
-        let content = sanitize_utf8(data["content"].as_str().unwrap_or(""));
+        let content = data["content"].as_str().unwrap_or("").to_string();
         let attachments = data["attachments"].as_array().cloned().unwrap_or_default();
         let has_attachments = !attachments.is_empty();
         // 只取图片类附件；QQ 的 url 字段可能不带协议前缀。

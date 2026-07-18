@@ -1,7 +1,8 @@
-//! SQLite 存储：与 Python 版完全同构的 schema / float16 向量 BLOB / ISO 时间戳，
-//! 现有 memory.db 无需迁移。向量检索是 O(n) 暴力余弦 + 新近度/等级/关键词加权。
+//! SQLite 存储：schema / float16 向量 BLOB / ISO 时间戳保持稳定，现有 memory.db 无需迁移。
+//! 向量检索是 O(n) 暴力余弦 + 新近度/等级/关键词加权。
 
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
@@ -195,6 +196,12 @@ CREATE INDEX IF NOT EXISTS idx_moods_user ON moods(user_id, created_at);
 /// 过期记忆先从检索里消失，再宽限这么多天才物理删除，留出反悔窗口。
 const PURGE_GRACE_DAYS: i64 = 7;
 
+/// SQLite 连接池大小。WAL 下多连接可并发读、写自动串行，个人规模 4 条足矣。
+const DB_POOL_SIZE: usize = 4;
+
+/// memories 表拼出 [`MemoryRow`] 所需的列，顺序与 [`MemoryRow::from_row`] 对应。
+const MEMORY_COLUMNS: &str = "id, text, kind, level, subject, created_at, last_seen_at, embedding";
+
 #[derive(Debug, Clone, Serialize)]
 pub struct EntityView {
     pub name: String,
@@ -252,7 +259,10 @@ pub struct NewMemory {
 
 #[derive(Clone)]
 pub struct Store {
-    conn: Arc<Mutex<Connection>>,
+    // 一把全局 Mutex 会让检索（O(n) 暴力扫描）与后台落库互相排队；改用小连接池，
+    // 靠 WAL 的多读单写 + busy_timeout 让并发操作尽量并行。
+    pool: Arc<Vec<Mutex<Connection>>>,
+    next: Arc<AtomicUsize>,
     cfg: Arc<Config>,
 }
 
@@ -262,27 +272,33 @@ impl Store {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        let conn = Connection::open(path).with_context(|| {
-            format!(
-                "无法打开数据库 {}。若挂载的数据目录属主不是本容器用户，请修正属主 \n                 （如 podman unshare chown）或重建卷。",
-                cfg.db_path
-            )
-        })?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
-        conn.pragma_update(None, "foreign_keys", "ON")?;
-        // 页缓存默认约 2MB；个人库读写量小，512KB 足够（负值单位为 KiB）。
-        conn.pragma_update(None, "cache_size", -512)?;
-        conn.execute_batch(SCHEMA)?;
-        let store = Self {
-            conn: Arc::new(Mutex::new(conn)),
-            cfg,
-        };
-        {
-            let guard = store.conn.lock().unwrap();
-            purge_expired(&guard)?;
+        let mut pool = Vec::with_capacity(DB_POOL_SIZE);
+        for index in 0..DB_POOL_SIZE {
+            let conn = Connection::open(path).with_context(|| {
+                format!(
+                    "无法打开数据库 {}。若挂载的数据目录属主不是本容器用户，请修正属主 \n                     （如 podman unshare chown）或重建卷。",
+                    cfg.db_path
+                )
+            })?;
+            conn.pragma_update(None, "journal_mode", "WAL")?;
+            conn.pragma_update(None, "synchronous", "NORMAL")?;
+            conn.pragma_update(None, "foreign_keys", "ON")?;
+            // 写并发下等锁而不是立刻返回 SQLITE_BUSY（毫秒）。
+            conn.pragma_update(None, "busy_timeout", 5000)?;
+            // 页缓存默认约 2MB；个人库读写量小，每连接 512KB 足够（负值单位为 KiB）。
+            conn.pragma_update(None, "cache_size", -512)?;
+            // schema 建表与开机清理只需在一条连接上做一次（CREATE IF NOT EXISTS 幂等）。
+            if index == 0 {
+                conn.execute_batch(SCHEMA)?;
+                purge_expired(&conn)?;
+            }
+            pool.push(Mutex::new(conn));
         }
-        Ok(store)
+        Ok(Self {
+            pool: Arc::new(pool),
+            next: Arc::new(AtomicUsize::new(0)),
+            cfg,
+        })
     }
 
     async fn run<T, F>(&self, f: F) -> Result<T>
@@ -290,10 +306,12 @@ impl Store {
         T: Send + 'static,
         F: FnOnce(&mut Connection, &Config) -> Result<T> + Send + 'static,
     {
-        let conn = self.conn.clone();
+        let pool = self.pool.clone();
         let cfg = self.cfg.clone();
+        // 轮询选一条连接；WAL 下并发操作落到不同连接上即可并行。
+        let index = self.next.fetch_add(1, Ordering::Relaxed) % pool.len();
         tokio::task::spawn_blocking(move || {
-            let mut guard = conn.lock().map_err(|_| anyhow!("存储锁中毒"))?;
+            let mut guard = pool[index].lock().map_err(|_| anyhow!("存储锁中毒"))?;
             f(&mut guard, &cfg)
         })
         .await
@@ -525,22 +543,11 @@ impl Store {
                 similarity: f32,
                 final_score: f32,
             }
-            let mut stmt = conn.prepare(
-                "SELECT id, text, kind, level, subject, created_at, last_seen_at, embedding \n                 FROM memories WHERE user_id = ?1 AND active = 1 \n                 AND (expires_at IS NULL OR expires_at > ?2)",
-            )?;
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {MEMORY_COLUMNS} FROM memories WHERE user_id = ?1 AND active = 1 \n                 AND (expires_at IS NULL OR expires_at > ?2)"
+            ))?;
             let rows: Vec<MemoryRow> = stmt
-                .query_map(params![user_id, now], |row| {
-                    Ok(MemoryRow {
-                        id: row.get(0)?,
-                        text: row.get(1)?,
-                        kind: row.get(2)?,
-                        level: row.get(3)?,
-                        subject: row.get(4)?,
-                        created_at: row.get(5)?,
-                        last_seen_at: row.get(6)?,
-                        embedding: row.get(7)?,
-                    })
-                })?
+                .query_map(params![user_id, now], MemoryRow::from_row)?
                 .collect::<std::result::Result<_, _>>()?;
             drop(stmt);
 
@@ -609,22 +616,14 @@ impl Store {
     pub async fn recent_memories(&self, user_id: String, limit: usize) -> Result<Vec<MemoryView>> {
         self.run(move |conn, _| {
             let now = now_iso();
-            let mut stmt = conn.prepare(
-                "SELECT id, text, kind, level, subject, created_at, last_seen_at, embedding \n                 FROM memories WHERE user_id = ?1 AND active = 1 \n                 AND (expires_at IS NULL OR expires_at > ?2) \n                 ORDER BY last_seen_at DESC LIMIT ?3",
-            )?;
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {MEMORY_COLUMNS} FROM memories WHERE user_id = ?1 AND active = 1 \n                 AND (expires_at IS NULL OR expires_at > ?2) \n                 ORDER BY last_seen_at DESC LIMIT ?3"
+            ))?;
             let rows: Vec<MemoryRow> = stmt
-                .query_map(params![user_id, now, limit.clamp(1, 100) as i64], |row| {
-                    Ok(MemoryRow {
-                        id: row.get(0)?,
-                        text: row.get(1)?,
-                        kind: row.get(2)?,
-                        level: row.get(3)?,
-                        subject: row.get(4)?,
-                        created_at: row.get(5)?,
-                        last_seen_at: row.get(6)?,
-                        embedding: row.get(7)?,
-                    })
-                })?
+                .query_map(
+                    params![user_id, now, limit.clamp(1, 100) as i64],
+                    MemoryRow::from_row,
+                )?
                 .collect::<std::result::Result<_, _>>()?;
             drop(stmt);
             rows.iter().map(|r| memory_view_from_row(conn, r)).collect()
@@ -691,24 +690,15 @@ impl Store {
             if exists.is_none() {
                 return Ok(Vec::new());
             }
-            let mut stmt = conn.prepare(
-                "WITH RECURSIVE newer(id) AS ( \n                   SELECT superseded_by FROM memories WHERE id = :mid AND superseded_by IS NOT NULL \n                   UNION \n                   SELECT m.superseded_by FROM memories m JOIN newer n ON m.id = n.id \n                   WHERE m.superseded_by IS NOT NULL \n                 ), older(id) AS ( \n                   SELECT id FROM memories WHERE superseded_by = :mid \n                   UNION \n                   SELECT m.id FROM memories m JOIN older o ON m.superseded_by = o.id \n                 ) \n                 SELECT id, text, kind, level, subject, created_at, last_seen_at, embedding, \n                        active, superseded_at \n                 FROM memories \n                 WHERE user_id = :uid \n                   AND (id = :mid OR id IN (SELECT id FROM newer) OR id IN (SELECT id FROM older)) \n                 ORDER BY created_at",
-            )?;
+            let mut stmt = conn.prepare(&format!(
+                "WITH RECURSIVE newer(id) AS ( \n                   SELECT superseded_by FROM memories WHERE id = :mid AND superseded_by IS NOT NULL \n                   UNION \n                   SELECT m.superseded_by FROM memories m JOIN newer n ON m.id = n.id \n                   WHERE m.superseded_by IS NOT NULL \n                 ), older(id) AS ( \n                   SELECT id FROM memories WHERE superseded_by = :mid \n                   UNION \n                   SELECT m.id FROM memories m JOIN older o ON m.superseded_by = o.id \n                 ) \n                 SELECT {MEMORY_COLUMNS}, active, superseded_at \n                 FROM memories \n                 WHERE user_id = :uid \n                   AND (id = :mid OR id IN (SELECT id FROM newer) OR id IN (SELECT id FROM older)) \n                 ORDER BY created_at"
+            ))?;
             let rows: Vec<(MemoryRow, bool, Option<String>)> = stmt
                 .query_map(
                     rusqlite::named_params! {":mid": memory_id, ":uid": user_id},
                     |row| {
                         Ok((
-                            MemoryRow {
-                                id: row.get(0)?,
-                                text: row.get(1)?,
-                                kind: row.get(2)?,
-                                level: row.get(3)?,
-                                subject: row.get(4)?,
-                                created_at: row.get(5)?,
-                                last_seen_at: row.get(6)?,
-                                embedding: row.get(7)?,
-                            },
+                            MemoryRow::from_row(row)?,
                             row.get::<_, i64>(8)? != 0,
                             row.get(9)?,
                         ))
@@ -914,6 +904,22 @@ struct MemoryRow {
     embedding: Vec<u8>,
 }
 
+impl MemoryRow {
+    /// 从以 [`MEMORY_COLUMNS`] 顺序开头的行取出各列（后续列由调用方另取）。
+    fn from_row(row: &rusqlite::Row) -> rusqlite::Result<Self> {
+        Ok(MemoryRow {
+            id: row.get(0)?,
+            text: row.get(1)?,
+            kind: row.get(2)?,
+            level: row.get(3)?,
+            subject: row.get(4)?,
+            created_at: row.get(5)?,
+            last_seen_at: row.get(6)?,
+            embedding: row.get(7)?,
+        })
+    }
+}
+
 fn memory_view_from_row(conn: &Connection, row: &MemoryRow) -> Result<MemoryView> {
     let mut stmt = conn.prepare(
         "SELECT e.name, e.type FROM memory_entities me \n         JOIN entities e ON e.key = me.entity_key WHERE me.memory_id = ?1",
@@ -945,20 +951,9 @@ fn memory_view_from_row(conn: &Connection, row: &MemoryRow) -> Result<MemoryView
 
 fn load_memory_row(conn: &Connection, id: &str) -> Result<MemoryRow> {
     Ok(conn.query_row(
-        "SELECT id, text, kind, level, subject, created_at, last_seen_at, embedding \n         FROM memories WHERE id = ?1",
+        &format!("SELECT {MEMORY_COLUMNS} FROM memories WHERE id = ?1"),
         params![id],
-        |row| {
-            Ok(MemoryRow {
-                id: row.get(0)?,
-                text: row.get(1)?,
-                kind: row.get(2)?,
-                level: row.get(3)?,
-                subject: row.get(4)?,
-                created_at: row.get(5)?,
-                last_seen_at: row.get(6)?,
-                embedding: row.get(7)?,
-            })
-        },
+        MemoryRow::from_row,
     )?)
 }
 

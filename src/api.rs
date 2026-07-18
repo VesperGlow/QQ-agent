@@ -1,4 +1,4 @@
-//! HTTP API（axum）：与 Python 版 FastAPI 路由一一对应。
+//! HTTP API（axum）：对话、记忆增删查、情绪时间线与记忆图谱端点。
 
 use std::sync::Arc;
 

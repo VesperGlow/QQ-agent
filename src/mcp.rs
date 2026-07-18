@@ -1,5 +1,5 @@
 //! 远程 MCP 工具（streamable-http）：手写的最小 JSON-RPC 客户端。
-//! 与 Python 版一致，采用"每次调用新建连接"策略——initialize → 请求 → 丢弃会话，
+//! 采用"每次调用新建连接"策略——initialize → 请求 → 丢弃会话，
 //! 避免长连接会话管理的复杂度，对个人项目的调用频率完全够用。
 
 use std::sync::Arc;

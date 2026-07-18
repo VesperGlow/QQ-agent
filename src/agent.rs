@@ -1,5 +1,4 @@
-//! 对话编排：检索记忆 → 组装上下文 → 工具循环 → 后台落库/评级/摘要。
-//! 提示词与行为与 Python 版逐字对齐。
+//! 对话编排：检索记忆 → 组装上下文 → 工具循环 → 落库/评级/摘要。
 
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -502,11 +501,11 @@ impl Agent {
         turn_usage += loop_usage;
         warnings.extend(tool_warnings);
 
-        // 历史落库、情绪记录、滚动摘要不影响本轮回复内容，放后台执行缩短响应延迟；
-        // 仅在本轮成功生成回复后才调度落库，避免失败时留下没有助手回复的悬空消息。
-        // 经 pending 追踪，优雅停机时会等这些写入完成。
+        // 历史落库必须在返回前完成：会话锁只在本轮期间持有，若异步落库，
+        // 同会话的下一条消息可能在写入 commit 前就 get_history，从而丢掉本轮上下文。
+        // 仅在成功生成回复后才落库，避免留下没有助手回复的悬空消息；
+        // 整轮已被 chat() 顶部的 pending guard 覆盖，优雅停机会等它做完。
         {
-            let agent = self.clone();
             // 历史只落文字加图片标记，不存 base64（省库容量；历史窗口也带不动图片）。
             let history_text = if images.is_empty() {
                 message.to_string()
@@ -515,32 +514,27 @@ impl Agent {
             } else {
                 format!("[图片×{}] {message}", images.len())
             };
-            let (user, convo, msg, reply) = (
-                user_id.to_string(),
-                conversation_id.clone(),
-                history_text,
-                content.clone(),
-            );
-            self.pending.spawn(async move {
-                if let Err(error) = agent
-                    .store
-                    .save_message(user.clone(), convo.clone(), "user".into(), msg)
-                    .await
-                {
-                    tracing::warn!("保存用户消息失败：{error:#}");
-                    return;
-                }
-                if let Err(error) = agent
-                    .store
-                    .save_message(user.clone(), convo.clone(), "assistant".into(), reply)
-                    .await
-                {
-                    tracing::warn!("保存助手消息失败：{error:#}");
-                }
-                if agent.cfg.conversation_summary_enabled {
+            let user = user_id.to_string();
+            let convo = conversation_id.clone();
+            if let Err(error) = self
+                .store
+                .save_message(user.clone(), convo.clone(), "user".into(), history_text)
+                .await
+            {
+                tracing::warn!("保存用户消息失败：{error:#}");
+            } else if let Err(error) = self
+                .store
+                .save_message(user.clone(), convo.clone(), "assistant".into(), content.clone())
+                .await
+            {
+                tracing::warn!("保存助手消息失败：{error:#}");
+            } else if self.cfg.conversation_summary_enabled {
+                // 摘要要调用 LLM、较重，且不影响本轮回复，仍放后台；pending 追踪以便停机等待。
+                let agent = self.clone();
+                self.pending.spawn(async move {
                     agent.maybe_update_summary(&user, &convo).await;
-                }
-            });
+                });
+            }
         }
         if self.cfg.mood_tracking_enabled {
             if let Some((label, valence, note)) = judge_mood {
@@ -861,7 +855,10 @@ impl Agent {
             let response = match self.llm.chat(Profile::Chat, &messages, params).await {
                 Ok(response) => response,
                 Err(error) => {
-                    if tools_enabled && error.status == Some(400) {
+                    // 仅在还没发生过任何工具往返时才把 400 当作"提供商不支持 tools"降级重试：
+                    // 若已有 tool 消息在 messages 里，去掉 tools 再发会留下孤立的 tool 往返，
+                    // 反而触发新的 400，此时应直接把错误抛出。
+                    if tools_enabled && error.status == Some(400) && events.is_empty() {
                         tools_enabled = false;
                         tracing::warn!("AI 提供商拒绝了 tools 参数，已降级为自动检索后直接对话");
                         warnings

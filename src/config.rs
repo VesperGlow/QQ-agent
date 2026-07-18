@@ -1,4 +1,4 @@
-//! 环境变量配置，变量名与 Python 版 Settings 完全一致，.env 无需改动。
+//! 环境变量配置：变量名保持稳定，现有 .env 无需改动。
 
 use std::env;
 
@@ -175,7 +175,6 @@ pub struct Config {
 
     pub mood_tracking_enabled: bool,
     pub mood_trend_days: i64,
-    pub mood_recent_limit: usize,
     pub time_awareness_enabled: bool,
 
     pub app_port: u16,
@@ -184,7 +183,7 @@ pub struct Config {
     /// 注意容器编排的 stop 宽限期（如 podman stop -t / stop_grace_period）要不小于该值。
     pub shutdown_timeout_seconds: u64,
 
-    // QQ 桥接（沿用 Go 版变量名）
+    // QQ 桥接
     pub qq_app_id: String,
     pub qq_app_secret: String,
     pub qq_event_mode: QqEventMode,
@@ -192,7 +191,6 @@ pub struct Config {
     pub qq_webhook_path: String,
     pub qq_ai_timeout_seconds: u64,
     pub qq_openapi_timeout_seconds: u64,
-    pub qq_bot_debug: bool,
     pub qq_reply_max_runes: usize,
     pub qq_reply_max_parts: usize,
     pub qq_workers: usize,
@@ -342,7 +340,6 @@ impl Config {
 
             mood_tracking_enabled: env_bool("MOOD_TRACKING_ENABLED", true),
             mood_trend_days: clamp(env_parse("MOOD_TREND_DAYS", 7), 1, 90),
-            mood_recent_limit: clamp(env_parse("MOOD_RECENT_LIMIT", 50), 1, 500),
             time_awareness_enabled: env_bool("TIME_AWARENESS_ENABLED", true),
 
             app_port: env_parse("APP_PORT_INTERNAL", 8000),
@@ -356,7 +353,6 @@ impl Config {
             qq_webhook_path,
             qq_ai_timeout_seconds: clamp(env_parse("QQ_AI_TIMEOUT_SECONDS", 180), 5, 600),
             qq_openapi_timeout_seconds: clamp(env_parse("QQ_OPENAPI_TIMEOUT_SECONDS", 15), 5, 60),
-            qq_bot_debug: env_bool("QQ_BOT_DEBUG", false),
             qq_reply_max_runes: clamp(env_parse("QQ_REPLY_MAX_RUNES", 1800), 200, 10000),
             qq_reply_max_parts: clamp(env_parse("QQ_REPLY_MAX_PARTS", 4), 1, 5),
             qq_workers: clamp(env_parse("QQ_WORKERS", 8), 1, 64),

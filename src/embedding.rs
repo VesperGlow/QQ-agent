@@ -1,6 +1,5 @@
 //! Embedding：默认进程内 ONNX 推理（onnx feature），或远程 OpenAI-compatible 接口。
-//! 模型下载目录布局与 Python 版 snapshot_download(local_dir=...) 一致，
-//! `$HF_HOME/local/<owner--repo>/`，已有缓存直接复用。
+//! 模型下载到 `$HF_HOME/local/<owner--repo>/`，已有缓存直接复用。
 
 use std::path::PathBuf;
 use std::sync::Arc;
