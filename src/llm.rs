@@ -25,10 +25,25 @@ impl LlmError {
     }
 }
 
+/// 单次调用的 token 用量（上游未返回 usage 时为 0）。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TokenUsage {
+    pub input: i64,
+    pub output: i64,
+}
+
+impl std::ops::AddAssign for TokenUsage {
+    fn add_assign(&mut self, rhs: Self) {
+        self.input += rhs.input;
+        self.output += rhs.output;
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct LlmResponse {
     pub content: String,
     pub tool_calls: Vec<Value>,
+    pub usage: TokenUsage,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -122,19 +137,22 @@ impl LlmClient {
                         let data: Value = response.json().await.map_err(|e| {
                             LlmError::new(format!("AI 接口响应不是 JSON：{e}"), None)
                         })?;
-                        let usage = &data["usage"];
-                        let tokens = match (
-                            usage["prompt_tokens"].as_i64(),
-                            usage["completion_tokens"].as_i64(),
-                        ) {
-                            (Some(p), Some(c)) => format!(" tokens={p}+{c}"),
-                            _ => String::new(),
+                        let usage = TokenUsage {
+                            input: data["usage"]["prompt_tokens"].as_i64().unwrap_or(0),
+                            output: data["usage"]["completion_tokens"].as_i64().unwrap_or(0),
+                        };
+                        let tokens = if usage.input > 0 || usage.output > 0 {
+                            format!(" tokens={}+{}", usage.input, usage.output)
+                        } else {
+                            String::new()
                         };
                         tracing::info!(
                             "LLM {model} 完成 耗时{:.1}s{tokens}",
                             started.elapsed().as_secs_f32()
                         );
-                        return parse_choice(&data);
+                        let mut parsed = parse_choice(&data)?;
+                        parsed.usage = usage;
+                        return Ok(parsed);
                     }
                 }
                 Err(e) => {
@@ -182,6 +200,7 @@ fn parse_choice(data: &Value) -> Result<LlmResponse, LlmError> {
     Ok(LlmResponse {
         content,
         tool_calls,
+        usage: TokenUsage::default(),
     })
 }
 

@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::config::Config;
 use crate::embedding::Embedder;
-use crate::llm::{ChatParams, LlmClient, LlmError};
+use crate::llm::{ChatParams, LlmClient, LlmError, TokenUsage};
 use crate::mcp::McpManager;
 use crate::shutdown::Pending;
 use crate::store::{ChatTurn, EntityView, MemoryView, NewMemory, Store};
@@ -272,6 +272,7 @@ struct JudgedMemory {
 struct JudgeOutcome {
     memories: Vec<JudgedMemory>,
     mood: Option<(String, i64, String)>,
+    usage: TokenUsage,
 }
 
 #[derive(Clone)]
@@ -452,8 +453,10 @@ impl Agent {
         let mut warnings: Vec<String> = Vec::new();
         let mut saved: Vec<MemoryView> = Vec::new();
         let mut judge_mood: Option<(String, i64, String)> = None;
+        let mut turn_usage = TokenUsage::default();
         match judged {
             Some(Ok(outcome)) => {
+                turn_usage += outcome.usage;
                 match self.save_judged_memories(user_id, outcome.memories).await {
                     Ok(items) => {
                         for item in &items {
@@ -480,7 +483,8 @@ impl Agent {
             None => {}
         }
 
-        let (content, tool_events, tool_warnings) = chat_result?;
+        let (content, tool_events, tool_warnings, loop_usage) = chat_result?;
+        turn_usage += loop_usage;
         warnings.extend(tool_warnings);
 
         // 历史落库、情绪记录、滚动摘要不影响本轮回复内容，放后台执行缩短响应延迟；
@@ -537,10 +541,12 @@ impl Agent {
         }
 
         tracing::info!(
-            "对话完成 user={user_id} convo={convo_tag} 检索{}条 工具{}次 新记忆{}条 耗时{:.1}s：{}",
+            "对话完成 user={user_id} convo={convo_tag} 检索{}条 工具{}次 新记忆{}条 tokens={}+{} 耗时{:.1}s：{}",
             retrieved.len(),
             tool_events.len(),
             saved.len(),
+            turn_usage.input,
+            turn_usage.output,
             started_at.elapsed().as_secs_f32(),
             preview(&content, self.cfg.log_preview_chars),
         );
@@ -745,6 +751,7 @@ impl Agent {
             }
             Err(error) => return Err(error.into()),
         };
+        let usage = response.usage;
         let data = extract_json_object(&response.content)?;
         let mood = parse_mood(&data["mood"]);
         let mut memories: Vec<JudgedMemory> = Vec::new();
@@ -776,7 +783,11 @@ impl Agent {
                 });
             }
         }
-        Ok(JudgeOutcome { memories, mood })
+        Ok(JudgeOutcome {
+            memories,
+            mood,
+            usage,
+        })
     }
 
     async fn save_judged_memories(
@@ -813,9 +824,10 @@ impl Agent {
         &self,
         user_id: &str,
         mut messages: Vec<Value>,
-    ) -> Result<(String, Vec<Value>, Vec<String>)> {
+    ) -> Result<(String, Vec<Value>, Vec<String>, TokenUsage)> {
         let mut events: Vec<Value> = Vec::new();
         let mut warnings: Vec<String> = Vec::new();
+        let mut usage = TokenUsage::default();
         let mut tools_enabled = true;
         let mut available_tools = builtin_tools();
         if self.mcp.enabled() {
@@ -841,6 +853,7 @@ impl Agent {
                     return Err(error.into());
                 }
             };
+            usage += response.usage;
 
             if response.tool_calls.is_empty() {
                 let content = response.content.trim().to_string();
@@ -849,7 +862,7 @@ impl Agent {
                 } else {
                     content
                 };
-                return Ok((content, events, warnings));
+                return Ok((content, events, warnings, usage));
             }
             if round_index >= self.cfg.max_tool_rounds {
                 tracing::warn!("已达到工具调用轮数上限（{}）", self.cfg.max_tool_rounds);
@@ -860,7 +873,7 @@ impl Agent {
                 } else {
                     content.to_string()
                 };
-                return Ok((content, events, warnings));
+                return Ok((content, events, warnings, usage));
             }
 
             messages.push(json!({
