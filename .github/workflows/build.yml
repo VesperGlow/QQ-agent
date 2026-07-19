@@ -84,11 +84,11 @@ jobs:
           platforms: linux/amd64
           push: ${{ github.event_name != 'pull_request' }}
           tags: |
-            ghcr.io/vesperglow/qq-agent:latest
-            ghcr.io/vesperglow/qq-agent:sha-${{ github.sha }}
+            ghcr.io/vesperglow/mneme:latest
+            ghcr.io/vesperglow/mneme:sha-${{ github.sha }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.title=QQ Agent
+            org.opencontainers.image.title=Mneme
           cache-from: type=gha,scope=rust
           cache-to: type=gha,mode=max,scope=rust

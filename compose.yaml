@@ -4,7 +4,7 @@ name: memory-graph-agent
 # SQLite 分级记忆与 QQ 桥接，只需填好 .env 即可启动。
 services:
   agent:
-    image: ${APP_IMAGE:-ghcr.io/vesperglow/qq-agent:latest}
+    image: ${APP_IMAGE:-ghcr.io/vesperglow/mneme:latest}
     build:
       context: .
     restart: unless-stopped
