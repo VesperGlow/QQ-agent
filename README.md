@@ -152,16 +152,20 @@ AI_THINKING_MAP_JSON='{"low":{"reasoning_effort":"low"},"high":{"reasoning_effor
 
 ### 查看已存记忆（CLI 子命令）
 
-二进制带参数即当作一次性子命令，直接查库并退出，不启动服务。运维排查时无需 sqlite、也不用管卷路径，`exec` 进容器即可：
+二进制（`mneme`）带参数即当作一次性子命令，直接查/改库并退出，不启动服务。运维排查时无需 sqlite、也不用管卷路径，`exec` 进容器即可：
 
 ```sh
-podman exec <容器> qq-agent memory list                 # 全部用户的活跃记忆（默认最多 200 条）
-podman exec <容器> qq-agent memory list --user qq:c2c:xxxx
-podman exec <容器> qq-agent memory list --all           # 含已失效（被遗忘/被取代）
-podman exec <容器> qq-agent memory list --limit 50 --json
+podman exec <容器> mneme memory list                 # 全部用户的活跃记忆（默认最多 200 条）
+podman exec <容器> mneme memory list --user qq:c2c:xxxx
+podman exec <容器> mneme memory list --all           # 含已失效（被遗忘/被取代）
+podman exec <容器> mneme memory list --limit 50 --json
+podman exec <容器> mneme memory show <id>            # 单条完整明细：文本/等级/实体/时间线/状态
+podman exec <容器> mneme memory forget <id>          # 软删除一条（active=0，库里留痕）
 ```
 
-只读打开（`query_only`），与运行中的服务共享同一 WAL 库、互不影响。默认文本表格每行为 `✓ 时间 L等级 kind ×重复次数 [用户尾号] 摘要`；`--json` 输出含 `id`/时间戳/`expires_at` 的完整字段。
+> 注意：容器名与镜像 tag 是独立的部署身份，未随二进制改名——默认部署里容器仍叫 `qq-agent`，故实际是 `podman exec qq-agent mneme memory list`。
+
+`list`/`show` 只读打开（`query_only`），与运行中的服务共享同一 WAL 库、互不影响；`forget` 是写操作，靠 WAL + busy_timeout 与服务并发安全。`list` 默认文本表格每行为 `✓ 时间 L等级 kind ×重复次数 [用户尾号] 完整id 摘要`，`--json` 输出全字段（含 `id`/时间戳/`expires_at`）。
 
 ## 对话 API
 

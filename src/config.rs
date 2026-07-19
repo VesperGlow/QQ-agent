@@ -532,23 +532,23 @@ mod tests {
 
     #[test]
     fn expand_refs_braced_and_bare() {
-        std::env::set_var("QQ_AGENT_TEST_KEY", "tvly-123");
+        std::env::set_var("MNEME_TEST_KEY", "tvly-123");
         assert_eq!(
-            expand_env_refs("https://x/?k=${QQ_AGENT_TEST_KEY}&v=$QQ_AGENT_TEST_KEY/mcp").unwrap(),
+            expand_env_refs("https://x/?k=${MNEME_TEST_KEY}&v=$MNEME_TEST_KEY/mcp").unwrap(),
             "https://x/?k=tvly-123&v=tvly-123/mcp"
         );
     }
 
     #[test]
     fn expand_refs_missing_var_fails() {
-        assert!(expand_env_refs("${QQ_AGENT_TEST_MISSING_VAR}").is_err());
+        assert!(expand_env_refs("${MNEME_TEST_MISSING_VAR}").is_err());
     }
 
     #[test]
     fn mcp_servers_parse_with_filters() {
-        std::env::set_var("QQ_AGENT_TEST_KEY2", "fc-abc");
+        std::env::set_var("MNEME_TEST_KEY2", "fc-abc");
         let servers = parse_mcp_servers(
-            r#"[{"name":"firecrawl","url":"https://mcp.firecrawl.dev/${QQ_AGENT_TEST_KEY2}/v2/mcp","tools":["firecrawl_scrape"]},{"name":"off","url":"https://x","enabled":false}]"#,
+            r#"[{"name":"firecrawl","url":"https://mcp.firecrawl.dev/${MNEME_TEST_KEY2}/v2/mcp","tools":["firecrawl_scrape"]},{"name":"off","url":"https://x","enabled":false}]"#,
         )
         .unwrap();
         assert_eq!(servers.len(), 1);

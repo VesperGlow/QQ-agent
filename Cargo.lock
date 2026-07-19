@@ -1595,6 +1595,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "mneme"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.22.1",
+ "chrono",
+ "dom_smoothie",
+ "ed25519-dalek",
+ "futures-util",
+ "half",
+ "hex",
+ "htmd",
+ "image",
+ "memmap2",
+ "ort",
+ "rand 0.9.5",
+ "regex",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror",
+ "tokenizers",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "monostate"
 version = "0.1.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1967,40 +2001,6 @@ name = "pxfm"
 version = "0.1.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
-
-[[package]]
-name = "qq-agent"
-version = "0.3.0"
-dependencies = [
- "anyhow",
- "axum",
- "base64 0.22.1",
- "chrono",
- "dom_smoothie",
- "ed25519-dalek",
- "futures-util",
- "half",
- "hex",
- "htmd",
- "image",
- "memmap2",
- "ort",
- "rand 0.9.5",
- "regex",
- "reqwest",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "thiserror",
- "tokenizers",
- "tokio",
- "tokio-tungstenite",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
 
 [[package]]
 name = "quinn"

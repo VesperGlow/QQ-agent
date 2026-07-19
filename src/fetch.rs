@@ -29,7 +29,7 @@ impl Fetcher {
             .timeout(Duration::from_secs_f64(timeout_seconds))
             // 自己逐跳跟重定向并校验，禁用 reqwest 的自动跟随，防止重定向到内网。
             .redirect(Policy::none())
-            .user_agent(concat!("qq-agent/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("mneme/", env!("CARGO_PKG_VERSION")))
             .build()?;
         Ok(Self {
             http,

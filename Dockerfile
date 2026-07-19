@@ -20,7 +20,7 @@ RUN touch src/main.rs && cargo build --release --locked
 
 # ort 若为动态链接会产出 libonnxruntime*.so，收集起来；静态链接时无产物。
 RUN mkdir -p /out/bin /out/lib && \
-    cp target/release/qq-agent /out/bin/ && \
+    cp target/release/mneme /out/bin/ && \
     (find target/release -maxdepth 4 -name 'libonnxruntime*.so*' -exec cp -a {} /out/lib/ \; || true)
 
 FROM debian:trixie-slim
@@ -32,7 +32,7 @@ RUN apt-get update && \
     mkdir -p /data /models && \
     chown appuser:appuser /data /models
 
-COPY --from=builder /out/bin/qq-agent /usr/local/bin/qq-agent
+COPY --from=builder /out/bin/mneme /usr/local/bin/mneme
 COPY --from=builder /out/lib/ /usr/local/lib/
 
 ENV HF_HOME=/models \
@@ -44,4 +44,4 @@ USER appuser
 VOLUME /data /models
 
 EXPOSE 8000 9000
-CMD ["qq-agent"]
+CMD ["mneme"]

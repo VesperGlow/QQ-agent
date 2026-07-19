@@ -62,7 +62,7 @@ impl<'a> McpConnection<'a> {
                 json!({
                     "protocolVersion": PROTOCOL_VERSION,
                     "capabilities": {},
-                    "clientInfo": {"name": "qq-agent", "version": env!("CARGO_PKG_VERSION")},
+                    "clientInfo": {"name": "mneme", "version": env!("CARGO_PKG_VERSION")},
                 }),
             )
             .await

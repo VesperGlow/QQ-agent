@@ -1,4 +1,4 @@
-//! QQ Agent：单进程二进制 —— HTTP API + 进程内 embedding + SQLite 分级记忆 + QQ 桥接。
+//! Mneme：单进程二进制 —— HTTP API + 进程内 embedding + SQLite 分级记忆 + QQ 桥接。
 
 mod agent;
 mod api;

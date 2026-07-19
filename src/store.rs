@@ -1168,6 +1168,113 @@ pub fn cli_list_memories(cfg: &Config, filter: &ListFilter) -> Result<Vec<Memory
     Ok(rows)
 }
 
+/// CLI `memory show` 的完整明细（不含向量）。
+#[derive(Debug, Serialize)]
+pub struct MemoryDetail {
+    pub id: String,
+    pub user_id: String,
+    pub subject: String,
+    pub kind: String,
+    pub level: i64,
+    pub source: String,
+    pub active: bool,
+    pub repetitions: i64,
+    pub access_count: i64,
+    pub created_at: String,
+    pub last_seen_at: String,
+    pub last_accessed_at: Option<String>,
+    pub expires_at: Option<String>,
+    pub forgotten_at: Option<String>,
+    pub superseded_by: Option<String>,
+    pub superseded_at: Option<String>,
+    pub entities: Vec<EntityView>,
+    pub text: String,
+}
+
+/// CLI 用：按 id 取单条记忆的完整明细 + 实体。只读打开。找不到返回 None。
+pub fn cli_show_memory(cfg: &Config, id: &str) -> Result<Option<MemoryDetail>> {
+    let conn = Connection::open(&cfg.db_path)
+        .with_context(|| format!("无法打开数据库 {}", cfg.db_path))?;
+    conn.pragma_update(None, "busy_timeout", 5000)?;
+    conn.pragma_update(None, "query_only", true)?;
+
+    let detail = conn
+        .query_row(
+            "SELECT id, user_id, subject, kind, level, source, active, repetitions, \
+             access_count, created_at, last_seen_at, last_accessed_at, expires_at, \
+             forgotten_at, superseded_by, superseded_at, text \
+             FROM memories WHERE id = ?1",
+            params![id],
+            |row| {
+                Ok(MemoryDetail {
+                    id: row.get(0)?,
+                    user_id: row.get(1)?,
+                    subject: row.get(2)?,
+                    kind: row.get(3)?,
+                    level: row.get(4)?,
+                    source: row.get(5)?,
+                    active: row.get::<_, i64>(6)? != 0,
+                    repetitions: row.get(7)?,
+                    access_count: row.get(8)?,
+                    created_at: row.get(9)?,
+                    last_seen_at: row.get(10)?,
+                    last_accessed_at: row.get(11)?,
+                    expires_at: row.get(12)?,
+                    forgotten_at: row.get(13)?,
+                    superseded_by: row.get(14)?,
+                    superseded_at: row.get(15)?,
+                    entities: Vec::new(),
+                    text: row.get(16)?,
+                })
+            },
+        )
+        .optional()?;
+
+    let Some(mut detail) = detail else {
+        return Ok(None);
+    };
+
+    let mut stmt = conn.prepare(
+        "SELECT e.name, e.type FROM memory_entities me \
+         JOIN entities e ON e.key = me.entity_key WHERE me.memory_id = ?1",
+    )?;
+    detail.entities = stmt
+        .query_map(params![id], |erow| {
+            Ok(EntityView {
+                name: erow.get(0)?,
+                kind: erow.get(1)?,
+            })
+        })?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(Some(detail))
+}
+
+/// CLI `memory forget <id>`：软删除一条记忆（active=0），返回被删的文本；
+/// 找不到或已是失效状态返回 None。是写操作，用可写连接（WAL + busy_timeout
+/// 与运行中的服务并发安全）。
+pub fn cli_forget_memory(cfg: &Config, id: &str) -> Result<Option<String>> {
+    let conn = Connection::open(&cfg.db_path)
+        .with_context(|| format!("无法打开数据库 {}", cfg.db_path))?;
+    conn.pragma_update(None, "busy_timeout", 5000)?;
+
+    let text: Option<String> = conn
+        .query_row(
+            "SELECT text FROM memories WHERE id = ?1 AND active = 1",
+            params![id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(text) = text else {
+        return Ok(None);
+    };
+
+    conn.execute(
+        "UPDATE memories SET active = 0, forgotten_at = ?1 WHERE id = ?2",
+        params![now_iso(), id],
+    )?;
+    Ok(Some(text))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

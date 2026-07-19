@@ -1,5 +1,5 @@
-//! 一次性子命令（如 `qq-agent memory list`）：不启动服务，直接查 SQLite。
-//! 供 `podman exec <容器> qq-agent memory list` 这类运维排查用。
+//! 一次性子命令（如 `mneme memory list`）：不启动服务，直接查/改 SQLite。
+//! 供 `podman exec <容器> mneme memory list` 这类运维排查用。
 
 use anyhow::{anyhow, bail, Result};
 
@@ -8,13 +8,18 @@ use crate::store::{self, ListFilter};
 
 const USAGE: &str = "\
 用法：
-  qq-agent memory list [--user <id>] [--limit N] [--all] [--json]
+  mneme memory list [--user <id>] [--limit N] [--all] [--json]
+  mneme memory show <id> [--json]
+  mneme memory forget <id>
 
-选项：
+选项（list）：
   -u, --user <id>   只看某个用户（如 qq:c2c:xxxx）
   -n, --limit N     最多列出多少条（默认 200）
   -a, --all         包含已失效的记忆（被遗忘/被取代）
-  -j, --json        输出 JSON（含 id / 时间戳 / 过期时间等完整字段）";
+  -j, --json        输出 JSON（含 id / 时间戳 / 过期时间等完整字段）
+
+show   按 id 打印单条完整明细（文本、等级、实体、时间线、状态）。
+forget 软删除一条记忆（active=0，可在库里保留痕迹），打印被删的文本。";
 
 /// 分发子命令。args 不含程序名（即 std::env::args().skip(1)）。
 pub fn run(cfg: &Config, args: &[String]) -> Result<()> {
@@ -32,6 +37,8 @@ pub fn run(cfg: &Config, args: &[String]) -> Result<()> {
 fn memory(cfg: &Config, args: &[String]) -> Result<()> {
     match args.first().map(String::as_str) {
         Some("list") => memory_list(cfg, &args[1..]),
+        Some("show") => memory_show(cfg, &args[1..]),
+        Some("forget") => memory_forget(cfg, &args[1..]),
         Some(other) => bail!("未知 memory 子命令：{other}\n\n{USAGE}"),
         None => bail!("memory 需要一个动作\n\n{USAGE}"),
     }
@@ -93,15 +100,94 @@ fn memory_list(cfg: &Config, args: &[String]) -> Result<()> {
             "{flag} {when}  L{:<2} {:<11} ×{}",
             row.level, row.kind, row.repetitions
         );
-        // 只在不按用户过滤时附上用户尾号，避免每行重复同一 id。
+        // 不按用户过滤时附上用户尾号区分；id 打全，供 show/forget 直接复制。
         if filter.user_id.is_none() {
-            line.push_str(&format!("  [{}]", short_user(&row.user_id)));
+            line.push_str(&format!("  [{}]", short_id(&row.user_id)));
         }
-        line.push_str("  ");
-        line.push_str(&text);
+        line.push_str(&format!("  {}  {}", row.id, text));
         println!("{line}");
     }
+    println!("\n（show/forget 用上面那串完整 id：mneme memory show <id>）");
     Ok(())
+}
+
+fn memory_show(cfg: &Config, args: &[String]) -> Result<()> {
+    let (id, as_json) = parse_id_and_json(args)?;
+    let Some(m) = store::cli_show_memory(cfg, &id)? else {
+        bail!("没有 id 为 {id} 的记忆");
+    };
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&m)?);
+        return Ok(());
+    }
+    let status = if m.active { "活跃" } else { "已失效" };
+    println!("id         {}", m.id);
+    println!("user       {}", m.user_id);
+    println!("状态       {status}（subject={}, source={}）", m.subject, m.source);
+    println!("分类/等级  {} / L{}", m.kind, m.level);
+    println!("计数       重复 ×{}，被检索 ×{}", m.repetitions, m.access_count);
+    println!("创建       {}", m.created_at);
+    println!("最近提及   {}", m.last_seen_at);
+    if let Some(v) = &m.last_accessed_at {
+        println!("最近检索   {v}");
+    }
+    match &m.expires_at {
+        Some(v) => println!("过期       {v}"),
+        None => println!("过期       永不（L10 或未设）"),
+    }
+    if let Some(v) = &m.forgotten_at {
+        println!("遗忘于     {v}");
+    }
+    if let Some(v) = &m.superseded_by {
+        println!("被取代为   {v}（superseded_at={}）", m.superseded_at.as_deref().unwrap_or("?"));
+    }
+    if !m.entities.is_empty() {
+        let joined = m
+            .entities
+            .iter()
+            .map(|e| format!("{}({})", e.name, e.kind))
+            .collect::<Vec<_>>()
+            .join("、");
+        println!("实体       {joined}");
+    }
+    println!("\n{}", m.text);
+    Ok(())
+}
+
+fn memory_forget(cfg: &Config, args: &[String]) -> Result<()> {
+    let (id, _) = parse_id_and_json(args)?;
+    match store::cli_forget_memory(cfg, &id)? {
+        Some(text) => {
+            println!("已遗忘（软删除，active=0）：");
+            println!("{}", truncate(&text, 200));
+            Ok(())
+        }
+        None => bail!("没有活跃的 id 为 {id} 的记忆（可能不存在或已失效）"),
+    }
+}
+
+/// 解析 `<id> [--json]`：第一个非选项参数当 id。
+fn parse_id_and_json(args: &[String]) -> Result<(String, bool)> {
+    let mut id: Option<String> = None;
+    let mut as_json = false;
+    for arg in args {
+        match arg.as_str() {
+            "--json" | "-j" => as_json = true,
+            "--help" | "-h" => {
+                println!("{USAGE}");
+                std::process::exit(0);
+            }
+            other if other.starts_with('-') => bail!("未知参数：{other}\n\n{USAGE}"),
+            other => {
+                if id.is_some() {
+                    bail!("只能指定一个 id");
+                }
+                id = Some(other.to_string());
+            }
+        }
+    }
+    let id = id.ok_or_else(|| anyhow!("需要一个记忆 id\n\n{USAGE}"))?;
+    Ok((id, as_json))
 }
 
 /// 按字符数截断并加省略号（避免在多字节字符中间切断）。
@@ -115,11 +201,11 @@ fn truncate(text: &str, max_chars: usize) -> String {
     out
 }
 
-/// user_id 尾 8 个字符，便于人眼区分而不刷屏。
-fn short_user(user_id: &str) -> String {
-    let chars: Vec<char> = user_id.chars().collect();
+/// 取尾 8 个字符，便于人眼区分而不刷屏。
+fn short_id(value: &str) -> String {
+    let chars: Vec<char> = value.chars().collect();
     if chars.len() <= 10 {
-        user_id.to_string()
+        value.to_string()
     } else {
         format!("…{}", chars[chars.len() - 8..].iter().collect::<String>())
     }
