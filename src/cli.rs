@@ -10,7 +10,8 @@ const USAGE: &str = "\
 用法：
   mneme memory list [--user <id>] [--limit N] [--all] [--json]
   mneme memory show <id> [--json]
-  mneme memory forget <id>
+  mneme memory forget <id> [<id> ...] [--purge --yes]
+  mneme memory forget --all [--purge] --yes
 
 选项（list）：
   -u, --user <id>   只看某个用户（如 qq:c2c:xxxx）
@@ -18,8 +19,13 @@ const USAGE: &str = "\
   -a, --all         包含已失效的记忆（被遗忘/被取代）
   -j, --json        输出 JSON（含 id / 时间戳 / 过期时间等完整字段）
 
-show   按 id 打印单条完整明细（文本、等级、实体、时间线、状态）。
-forget 软删除一条记忆（active=0，可在库里保留痕迹），打印被删的文本。";
+选项（forget）：
+  -a, --all         删除全部记忆（必须配 --yes）
+      --purge       改为硬删除（彻底 DELETE + 级联清实体链接，不可逆，需 --yes）
+  -y, --yes         确认危险操作（--all 或 --purge 时必需）
+
+show   按 id（或前缀）打印单条完整明细：文本、等级、实体、时间线、状态。
+forget 默认软删除（active=0，库里留痕、检索不到）；可一次给多个 id/前缀。";
 
 /// 分发子命令。args 不含程序名（即 std::env::args().skip(1)）。
 pub fn run(cfg: &Config, args: &[String]) -> Result<()> {
@@ -162,15 +168,65 @@ fn memory_show(cfg: &Config, args: &[String]) -> Result<()> {
 }
 
 fn memory_forget(cfg: &Config, args: &[String]) -> Result<()> {
-    let (id, _) = parse_id_and_json(args)?;
-    match store::cli_forget_memory(cfg, &id)? {
-        Some(text) => {
-            println!("已遗忘（软删除，active=0）：");
-            println!("{}", truncate(&text, 200));
-            Ok(())
+    let mut ids: Vec<String> = Vec::new();
+    let mut all = false;
+    let mut purge = false;
+    let mut yes = false;
+    for arg in args {
+        match arg.as_str() {
+            "--all" | "-a" => all = true,
+            "--purge" => purge = true,
+            "--yes" | "-y" => yes = true,
+            "--help" | "-h" => {
+                println!("{USAGE}");
+                return Ok(());
+            }
+            other if other.starts_with('-') => bail!("未知参数：{other}\n\n{USAGE}"),
+            other => ids.push(other.to_string()),
         }
-        None => bail!("没有活跃的 id 为 {id} 的记忆（可能不存在或已失效）"),
     }
+
+    // 删除全部：危险，强制 --yes 确认。
+    if all {
+        if !ids.is_empty() {
+            bail!("--all 不能和具体 id 混用");
+        }
+        if !yes {
+            let how = if purge { "硬删除（彻底 DELETE，不可逆）" } else { "软删除（active=0）" };
+            let extra = if purge { " --purge" } else { "" };
+            bail!("这会{how}全部记忆。确认请加 --yes：\n  mneme memory forget --all{extra} --yes");
+        }
+        let n = store::cli_forget_all(cfg, purge)?;
+        let how = if purge { "硬删除" } else { "软删除（active=0，--all 仍可见）" };
+        println!("已{how} {n} 条记忆。");
+        return Ok(());
+    }
+
+    if ids.is_empty() {
+        bail!("需要一个或多个记忆 id（或 --all）\n\n{USAGE}");
+    }
+    // 硬删单条也不可逆，要 --yes。
+    if purge && !yes {
+        bail!("--purge 是不可逆硬删除，确认请加 --yes");
+    }
+
+    let mut done = 0usize;
+    for id in &ids {
+        match store::cli_forget_memory(cfg, id, purge) {
+            Ok(Some(text)) => {
+                done += 1;
+                let how = if purge { "硬删除" } else { "已遗忘" };
+                println!("✓ {how} {id}：{}", truncate(&text, 80));
+            }
+            Ok(None) => println!("✗ 未找到{}记忆：{id}", if purge { "" } else { "活跃" }),
+            // 前缀歧义等错误只影响这一条，不中断整批。
+            Err(error) => println!("✗ {id}：{error}"),
+        }
+    }
+    if ids.len() > 1 {
+        println!("\n完成：{done}/{} 条。", ids.len());
+    }
+    Ok(())
 }
 
 /// 解析 `<id> [--json]`：第一个非选项参数当 id。

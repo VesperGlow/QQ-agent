@@ -1280,12 +1280,15 @@ pub fn cli_show_memory(cfg: &Config, id: &str) -> Result<Option<MemoryDetail>> {
 /// CLI `memory forget <id>`：软删除一条记忆（active=0），返回被删的文本；
 /// 找不到或已是失效状态返回 None。是写操作，用可写连接（WAL + busy_timeout
 /// 与运行中的服务并发安全）。
-pub fn cli_forget_memory(cfg: &Config, id: &str) -> Result<Option<String>> {
+pub fn cli_forget_memory(cfg: &Config, id: &str, purge: bool) -> Result<Option<String>> {
     let conn = Connection::open(&cfg.db_path)
         .with_context(|| format!("无法打开数据库 {}", cfg.db_path))?;
     conn.pragma_update(None, "busy_timeout", 5000)?;
+    // 硬删要靠 FK 级联清掉 memory_entities/memory_links。
+    conn.pragma_update(None, "foreign_keys", true)?;
 
-    let full_id = match resolve_memory_id(&conn, id, true)? {
+    // 硬删可作用于任意记忆；软删只针对活跃记忆。
+    let full_id = match resolve_memory_id(&conn, id, !purge)? {
         Some(full) => full,
         None => return Ok(None),
     };
@@ -1295,11 +1298,35 @@ pub fn cli_forget_memory(cfg: &Config, id: &str) -> Result<Option<String>> {
         |row| row.get(0),
     )?;
 
-    conn.execute(
-        "UPDATE memories SET active = 0, forgotten_at = ?1 WHERE id = ?2",
-        params![now_iso(), full_id],
-    )?;
+    if purge {
+        conn.execute("DELETE FROM memories WHERE id = ?1", params![full_id])?;
+    } else {
+        conn.execute(
+            "UPDATE memories SET active = 0, forgotten_at = ?1 WHERE id = ?2",
+            params![now_iso(), full_id],
+        )?;
+    }
     Ok(Some(text))
+}
+
+/// CLI `memory forget --all`：软删所有活跃记忆（active=0），或 purge 硬删全部。
+/// 返回受影响条数。危险操作，调用方（cli）负责 --yes 确认。
+pub fn cli_forget_all(cfg: &Config, purge: bool) -> Result<usize> {
+    let conn = Connection::open(&cfg.db_path)
+        .with_context(|| format!("无法打开数据库 {}", cfg.db_path))?;
+    conn.pragma_update(None, "busy_timeout", 5000)?;
+    conn.pragma_update(None, "foreign_keys", true)?;
+
+    let affected = if purge {
+        // WHERE 1 = ?1 恒真，既删全部又避免空参数数组的类型推断歧义。
+        conn.execute("DELETE FROM memories WHERE 1 = ?1", params![1_i64])?
+    } else {
+        conn.execute(
+            "UPDATE memories SET active = 0, forgotten_at = ?1 WHERE active = 1",
+            params![now_iso()],
+        )?
+    };
+    Ok(affected)
 }
 
 #[cfg(test)]
