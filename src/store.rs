@@ -1088,6 +1088,86 @@ fn create_memory_sync(conn: &mut Connection, cfg: &Config, new: NewMemory) -> Re
     Ok(view)
 }
 
+/// CLI `memory list` 的一行。刻意不含 embedding BLOB，避免打印二进制。
+#[derive(Debug, Serialize)]
+pub struct MemoryListRow {
+    pub id: String,
+    pub user_id: String,
+    pub created_at: String,
+    pub last_seen_at: String,
+    pub kind: String,
+    pub level: i64,
+    pub repetitions: i64,
+    pub active: bool,
+    pub expires_at: Option<String>,
+    pub text: String,
+}
+
+/// `memory list` 的过滤条件。
+pub struct ListFilter {
+    /// 只看某个 user_id；None = 全部用户。
+    pub user_id: Option<String>,
+    /// 是否包含已失效（被遗忘/被取代）的记忆。
+    pub include_inactive: bool,
+    pub limit: usize,
+}
+
+/// CLI 用：直接查记忆，不建表、不清理、不预热。用 query_only 防写，与运行中的
+/// 服务共享同一 WAL 数据库（同机多进程读安全）。
+pub fn cli_list_memories(cfg: &Config, filter: &ListFilter) -> Result<Vec<MemoryListRow>> {
+    let conn = Connection::open(&cfg.db_path)
+        .with_context(|| format!("无法打开数据库 {}", cfg.db_path))?;
+    conn.pragma_update(None, "busy_timeout", 5000)?;
+    // 防御性只读：本连接拒绝任何写入，但仍能正常读 WAL。
+    conn.pragma_update(None, "query_only", true)?;
+
+    let mut sql = String::from(
+        "SELECT id, user_id, created_at, last_seen_at, kind, level, repetitions, active, expires_at, text \
+         FROM memories",
+    );
+    let mut clauses: Vec<&str> = Vec::new();
+    if !filter.include_inactive {
+        clauses.push("active = 1");
+    }
+    if filter.user_id.is_some() {
+        clauses.push("user_id = ?1");
+    }
+    if !clauses.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&clauses.join(" AND "));
+    }
+    sql.push_str(&format!(" ORDER BY created_at DESC LIMIT {}", filter.limit.max(1)));
+
+    let map_row = |row: &rusqlite::Row| -> rusqlite::Result<MemoryListRow> {
+        Ok(MemoryListRow {
+            id: row.get(0)?,
+            user_id: row.get(1)?,
+            created_at: row.get(2)?,
+            last_seen_at: row.get(3)?,
+            kind: row.get(4)?,
+            level: row.get(5)?,
+            repetitions: row.get(6)?,
+            active: row.get::<_, i64>(7)? != 0,
+            expires_at: row.get(8)?,
+            text: row.get(9)?,
+        })
+    };
+
+    // 只有按用户过滤时才有 ?1 占位符；用 params_from_iter 统一处理 0/1 个参数，
+    // 避免空参数数组的类型推断歧义。
+    let bind: Vec<&dyn rusqlite::ToSql> = filter
+        .user_id
+        .as_ref()
+        .map(|uid| vec![uid as &dyn rusqlite::ToSql])
+        .unwrap_or_default();
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows: Vec<MemoryListRow> = stmt
+        .query_map(rusqlite::params_from_iter(bind), map_row)?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(rows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

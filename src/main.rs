@@ -2,6 +2,7 @@
 
 mod agent;
 mod api;
+mod cli;
 mod config;
 mod embedding;
 mod fetch;
@@ -22,6 +23,14 @@ use anyhow::{Context, Result};
 #[tokio::main(worker_threads = 2)]
 async fn main() -> Result<()> {
     let cfg = Arc::new(config::Config::from_env()?);
+
+    // 带参数即当作一次性子命令（如 `memory list`）：直接查库并退出，不启动服务、
+    // 不初始化 embedding/QQ，也不打日志，保持输出干净。
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if !args.is_empty() {
+        return cli::run(&cfg, &args);
+    }
+
     let level = cfg.log_level.to_lowercase();
     tracing_subscriber::fmt()
         .with_env_filter(

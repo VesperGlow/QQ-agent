@@ -150,6 +150,19 @@ AI_THINKING_MAP_JSON='{"low":{"reasoning_effort":"low"},"high":{"reasoning_effor
 
 已入库的向量按写入时的维度保存。要改变 `EMBEDDING_DIMENSIONS` 或换 embedding 模型，需要重新生成全部记忆向量；全新测试环境也可以用 `docker compose down -v` 清空数据后重建（这会永久删除全部记忆数据和模型缓存）。
 
+### 查看已存记忆（CLI 子命令）
+
+二进制带参数即当作一次性子命令，直接查库并退出，不启动服务。运维排查时无需 sqlite、也不用管卷路径，`exec` 进容器即可：
+
+```sh
+podman exec <容器> qq-agent memory list                 # 全部用户的活跃记忆（默认最多 200 条）
+podman exec <容器> qq-agent memory list --user qq:c2c:xxxx
+podman exec <容器> qq-agent memory list --all           # 含已失效（被遗忘/被取代）
+podman exec <容器> qq-agent memory list --limit 50 --json
+```
+
+只读打开（`query_only`），与运行中的服务共享同一 WAL 库、互不影响。默认文本表格每行为 `✓ 时间 L等级 kind ×重复次数 [用户尾号] 摘要`；`--json` 输出含 `id`/时间戳/`expires_at` 的完整字段。
+
 ## 对话 API
 
 ```sh
