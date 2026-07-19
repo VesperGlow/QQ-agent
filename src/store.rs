@@ -1309,6 +1309,89 @@ pub fn cli_forget_memory(cfg: &Config, id: &str, purge: bool) -> Result<Option<S
     Ok(Some(text))
 }
 
+/// CLI `memory stats` 的聚合结果。by_level/by_kind/oldest/newest 只统计活跃记忆。
+#[derive(Debug, Serialize)]
+pub struct MemoryStats {
+    pub total: usize,
+    pub active: usize,
+    pub inactive: usize,
+    pub users: usize,
+    pub by_level: Vec<(i64, usize)>,
+    pub by_kind: Vec<(String, usize)>,
+    pub oldest: Option<String>,
+    pub newest: Option<String>,
+}
+
+/// CLI 用：单次扫描 memories 在 Rust 侧聚合出统计。只读打开。
+pub fn cli_stats(cfg: &Config, user: Option<&str>) -> Result<MemoryStats> {
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+    let conn = Connection::open(&cfg.db_path)
+        .with_context(|| format!("无法打开数据库 {}", cfg.db_path))?;
+    conn.pragma_update(None, "busy_timeout", 5000)?;
+    conn.pragma_update(None, "query_only", true)?;
+
+    let sql = if user.is_some() {
+        "SELECT active, level, kind, created_at, user_id FROM memories WHERE user_id = ?1"
+    } else {
+        "SELECT active, level, kind, created_at, user_id FROM memories"
+    };
+    let bind: Vec<&dyn rusqlite::ToSql> = user
+        .map(|u| vec![u as &dyn rusqlite::ToSql])
+        .unwrap_or_default();
+
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(bind), |row| {
+        Ok((
+            row.get::<_, i64>(0)? != 0,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+        ))
+    })?;
+
+    let mut total = 0usize;
+    let mut active = 0usize;
+    let mut users: BTreeSet<String> = BTreeSet::new();
+    let mut level_map: BTreeMap<i64, usize> = BTreeMap::new();
+    let mut kind_map: HashMap<String, usize> = HashMap::new();
+    let mut oldest: Option<String> = None;
+    let mut newest: Option<String> = None;
+
+    for row in rows {
+        let (is_active, level, kind, created_at, user_id) = row?;
+        total += 1;
+        users.insert(user_id);
+        if is_active {
+            active += 1;
+            *level_map.entry(level).or_default() += 1;
+            *kind_map.entry(kind).or_default() += 1;
+            if oldest.as_ref().is_none_or(|o| &created_at < o) {
+                oldest = Some(created_at.clone());
+            }
+            if newest.as_ref().is_none_or(|n| &created_at > n) {
+                newest = Some(created_at);
+            }
+        }
+    }
+
+    let by_level: Vec<(i64, usize)> = level_map.into_iter().collect();
+    let mut by_kind: Vec<(String, usize)> = kind_map.into_iter().collect();
+    by_kind.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    Ok(MemoryStats {
+        total,
+        active,
+        inactive: total - active,
+        users: users.len(),
+        by_level,
+        by_kind,
+        oldest,
+        newest,
+    })
+}
+
 /// CLI `memory forget --all`：软删所有活跃记忆（active=0），或 purge 硬删全部。
 /// 返回受影响条数。危险操作，调用方（cli）负责 --yes 确认。
 pub fn cli_forget_all(cfg: &Config, purge: bool) -> Result<usize> {

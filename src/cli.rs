@@ -12,6 +12,7 @@ const USAGE: &str = "\
   mneme memory show <id> [--json]
   mneme memory forget <id> [<id> ...] [--purge --yes]
   mneme memory forget --all [--purge] --yes
+  mneme memory stats [--user <id>] [--json]
 
 选项（list）：
   -u, --user <id>   只看某个用户（如 qq:c2c:xxxx）
@@ -25,7 +26,8 @@ const USAGE: &str = "\
   -y, --yes         确认危险操作（--all 或 --purge 时必需）
 
 show   按 id（或前缀）打印单条完整明细：文本、等级、实体、时间线、状态。
-forget 默认软删除（active=0，库里留痕、检索不到）；可一次给多个 id/前缀。";
+forget 默认软删除（active=0，库里留痕、检索不到）；可一次给多个 id/前缀。
+stats  按活跃/失效、等级、类型汇总条数（只读），删完核对用。";
 
 /// 分发子命令。args 不含程序名（即 std::env::args().skip(1)）。
 pub fn run(cfg: &Config, args: &[String]) -> Result<()> {
@@ -45,6 +47,7 @@ fn memory(cfg: &Config, args: &[String]) -> Result<()> {
         Some("list") => memory_list(cfg, &args[1..]),
         Some("show") => memory_show(cfg, &args[1..]),
         Some("forget") => memory_forget(cfg, &args[1..]),
+        Some("stats") => memory_stats(cfg, &args[1..]),
         Some(other) => bail!("未知 memory 子命令：{other}\n\n{USAGE}"),
         None => bail!("memory 需要一个动作\n\n{USAGE}"),
     }
@@ -225,6 +228,58 @@ fn memory_forget(cfg: &Config, args: &[String]) -> Result<()> {
     }
     if ids.len() > 1 {
         println!("\n完成：{done}/{} 条。", ids.len());
+    }
+    Ok(())
+}
+
+fn memory_stats(cfg: &Config, args: &[String]) -> Result<()> {
+    let mut user: Option<String> = None;
+    let mut as_json = false;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--json" | "-j" => as_json = true,
+            "--user" | "-u" => {
+                user = Some(it.next().ok_or_else(|| anyhow!("--user 需要一个值"))?.clone());
+            }
+            "--help" | "-h" => {
+                println!("{USAGE}");
+                return Ok(());
+            }
+            other => bail!("未知参数：{other}\n\n{USAGE}"),
+        }
+    }
+
+    let s = store::cli_stats(cfg, user.as_deref())?;
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&s)?);
+        return Ok(());
+    }
+
+    println!(
+        "活跃 {} · 已失效 {} · 合计 {}（{} 个用户）",
+        s.active, s.inactive, s.total, s.users
+    );
+    if s.active == 0 {
+        println!("（无活跃记忆）");
+        return Ok(());
+    }
+    let levels = s
+        .by_level
+        .iter()
+        .map(|(l, c)| format!("L{l}×{c}"))
+        .collect::<Vec<_>>()
+        .join("  ");
+    println!("等级：{levels}");
+    let kinds = s
+        .by_kind
+        .iter()
+        .map(|(k, c)| format!("{k}×{c}"))
+        .collect::<Vec<_>>()
+        .join("  ");
+    println!("类型：{kinds}");
+    if let (Some(o), Some(n)) = (&s.oldest, &s.newest) {
+        println!("跨度：{} ~ {}", o.get(0..10).unwrap_or(o), n.get(0..10).unwrap_or(n));
     }
     Ok(())
 }
