@@ -1,10 +1,11 @@
-//! SQLite 存储：schema / float16 向量 BLOB / ISO 时间戳保持稳定，现有 memory.db 无需迁移。
+//! SQLite 存储：关系数据（对话/记忆/实体/情绪）在普通表，向量存进 sqlite-vec 的 vec0
+//! 虚拟表做余弦 KNN；rowid 对应 memories 行。旧库首次启动会把 f16 BLOB 向量迁进 vec0。
 //! 追加式（append-only）：记忆只新增，不因时间过期；软删除/取代仍保留可审计留痕。
-//! 检索是 O(n) 暴力余弦一段召回，二段精排（rerank）在 agent 层完成。
+//! 检索一段 = vec0 KNN 召回候选，二段精排（rerank）在 agent 层完成。
 
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{Duration, SecondsFormat, Utc};
@@ -54,8 +55,75 @@ pub fn blob_to_vec(blob: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-fn dot(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+/// vec0 需要原始 float32 小端字节；检索与入库都用它把 `Vec<f32>` 变成可绑定的 BLOB。
+fn vec_to_blob_f32(vector: &[f32]) -> Vec<u8> {
+    let mut blob = Vec::with_capacity(vector.len() * 4);
+    for value in vector {
+        blob.extend_from_slice(&value.to_le_bytes());
+    }
+    blob
+}
+
+/// 进程内注册 sqlite-vec（vec0 虚拟表）。auto_extension 只对注册之后新开的连接生效，
+/// 故须在任何 `Connection::open` 之前调用；`Once` 保证只注册一次。
+fn register_vec_extension() {
+    static VEC_INIT: Once = Once::new();
+    VEC_INIT.call_once(|| unsafe {
+        rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+            sqlite_vec::sqlite3_vec_init as *const (),
+        )));
+    });
+}
+
+/// 建 vec0 向量表（幂等）。`embedding` 是向量列，`user_id`/`subject`/`kind` 是可在 KNN
+/// 里过滤的元数据列；rowid 对应 `memories` 的隐式 rowid，距离用余弦（1 − 余弦相似度）。
+fn ensure_vec_table(conn: &Connection, dim: usize) -> Result<()> {
+    conn.execute_batch(&format!(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS vec_memories USING vec0(\n           embedding float[{dim}] distance_metric=cosine,\n           user_id text,\n           subject text,\n           kind text\n         );"
+    ))?;
+    Ok(())
+}
+
+/// 旧库迁移：把 `memories.embedding`（f16 BLOB）里活跃记忆的向量回填进 vec0，成功后移除
+/// `embedding` 列（向量从此只存 vec0 一份）。幂等：每次先清空 vec0 再回填；无该列则跳过。
+fn migrate_embeddings_to_vec0(conn: &mut Connection, dim: usize) -> Result<()> {
+    let has_col: bool = conn.query_row(
+        "SELECT count(*) FROM pragma_table_info('memories') WHERE name = 'embedding'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )? > 0;
+    if !has_col {
+        return Ok(());
+    }
+    let tx = conn.transaction()?;
+    tx.execute("DELETE FROM vec_memories", [])?;
+    let rows: Vec<(i64, Vec<u8>, String, String, String)> = {
+        let mut stmt = tx.prepare(
+            "SELECT rowid, embedding, user_id, subject, kind FROM memories WHERE active = 1",
+        )?;
+        stmt.query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+        })?
+        .collect::<std::result::Result<_, _>>()?
+    };
+    let mut migrated = 0usize;
+    for (rowid, blob, user_id, subject, kind) in rows {
+        let vector = blob_to_vec(&blob);
+        if vector.len() != dim {
+            tracing::warn!("跳过维度不符的旧向量 rowid={rowid}（{} != {dim}）", vector.len());
+            continue;
+        }
+        tx.execute(
+            "INSERT INTO vec_memories(rowid, embedding, user_id, subject, kind) \n             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![rowid, vec_to_blob_f32(&vector), user_id, subject, kind],
+        )?;
+        migrated += 1;
+    }
+    tx.commit()?;
+    // 回填提交成功后再删列（不可逆）；中途失败则下次启动重跑（先清空再回填，幂等）。
+    conn.execute("ALTER TABLE memories DROP COLUMN embedding", [])?;
+    tracing::info!("向量已迁移到 vec0：{migrated} 条，memories.embedding 列已移除");
+    Ok(())
 }
 
 const SCHEMA: &str = r#"
@@ -89,7 +157,6 @@ CREATE TABLE IF NOT EXISTS memories (
   kind TEXT NOT NULL,
   level INTEGER NOT NULL,
   subject TEXT NOT NULL DEFAULT 'user',
-  embedding BLOB NOT NULL,
   fingerprint TEXT NOT NULL,
   source TEXT NOT NULL,
   active INTEGER NOT NULL DEFAULT 1,
@@ -140,7 +207,7 @@ CREATE INDEX IF NOT EXISTS idx_moods_user ON moods(user_id, created_at);
 const DB_POOL_SIZE: usize = 4;
 
 /// memories 表拼出 [`MemoryRow`] 所需的列，顺序与 [`MemoryRow::from_row`] 对应。
-const MEMORY_COLUMNS: &str = "id, text, kind, level, subject, created_at, last_seen_at, embedding";
+const MEMORY_COLUMNS: &str = "id, text, kind, level, subject, created_at, last_seen_at";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct EntityView {
@@ -212,9 +279,11 @@ impl Store {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
+        // vec0 扩展须在开连接前注册（对之后新开的每条连接生效）。
+        register_vec_extension();
         let mut pool = Vec::with_capacity(DB_POOL_SIZE);
         for index in 0..DB_POOL_SIZE {
-            let conn = Connection::open(path).with_context(|| {
+            let mut conn = Connection::open(path).with_context(|| {
                 format!(
                     "无法打开数据库 {}。若挂载的数据目录属主不是本容器用户，请修正属主 \n                     （如 podman unshare chown）或重建卷。",
                     cfg.db_path
@@ -227,10 +296,12 @@ impl Store {
             conn.pragma_update(None, "busy_timeout", 5000)?;
             // 页缓存默认约 2MB；个人库读写量小，每连接 512KB 足够（负值单位为 KiB）。
             conn.pragma_update(None, "cache_size", -512)?;
-            // schema 建表只需在一条连接上做一次（CREATE IF NOT EXISTS 幂等）。
+            // schema 建表 + vec0 表 + 旧库向量迁移只需在一条连接上做一次（均幂等）。
             // 追加式存储：不再有开机清理过期记忆这一步。
             if index == 0 {
                 conn.execute_batch(SCHEMA)?;
+                ensure_vec_table(&conn, cfg.embedding_dimensions)?;
+                migrate_embeddings_to_vec0(&mut conn, cfg.embedding_dimensions)?;
             }
             pool.push(Mutex::new(conn));
         }
@@ -472,26 +543,23 @@ impl Store {
             let limit = limit.unwrap_or(cfg.memory_search_limit);
             let min_score = min_score.unwrap_or(cfg.memory_min_score);
             let now = now_iso();
+            let query = vec_to_blob_f32(&embedding);
 
-            // 追加式：不再按 expires_at 过滤，活跃记忆全部参与召回。
+            // 一段召回 = vec0 KNN：按 user_id 过滤的余弦最近邻（vec0 只存活跃记忆）。
+            // distance = 1 − 余弦相似度；相似度低于 min_score 的丢弃，最终排序交给二段 rerank。
             let mut stmt = conn.prepare(&format!(
-                "SELECT {MEMORY_COLUMNS} FROM memories WHERE user_id = ?1 AND active = 1"
+                "SELECT {MEMORY_COLUMNS}, knn.distance FROM ( \n                   SELECT rowid, distance FROM vec_memories \n                   WHERE embedding MATCH ?1 AND user_id = ?2 AND k = ?3 \n                 ) knn \n                 JOIN memories m ON m.rowid = knn.rowid \n                 WHERE m.active = 1 \n                 ORDER BY knn.distance"
             ))?;
-            let rows: Vec<MemoryRow> = stmt
-                .query_map(params![user_id], MemoryRow::from_row)?
-                .collect::<std::result::Result<_, _>>()?;
+            let scored: Vec<(MemoryRow, f32)> = stmt
+                .query_map(params![query, user_id, limit as i64], |row| {
+                    let similarity = (1.0 - row.get::<_, f64>(7)?) as f32;
+                    Ok((MemoryRow::from_row(row)?, similarity))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+                .into_iter()
+                .filter(|(_, similarity)| *similarity >= min_score)
+                .collect();
             drop(stmt);
-
-            let mut scored: Vec<(MemoryRow, f32)> = Vec::new();
-            for rowdata in rows {
-                // 向量入库前已 L2 归一化，点积即余弦相似度。
-                let similarity = dot(&blob_to_vec(&rowdata.embedding), &embedding);
-                if similarity >= min_score {
-                    scored.push((rowdata, similarity));
-                }
-            }
-            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            scored.truncate(limit);
 
             let tx = conn.transaction()?;
             for (rowdata, _) in &scored {
@@ -538,10 +606,19 @@ impl Store {
 
     pub async fn forget_memory(&self, user_id: String, memory_id: String) -> Result<bool> {
         self.run(move |conn, _| {
-            let changed = conn.execute(
+            let tx = conn.transaction()?;
+            let changed = tx.execute(
                 "UPDATE memories SET active = 0, forgotten_at = ?1 \n                 WHERE id = ?2 AND user_id = ?3 AND active = 1",
                 params![now_iso(), memory_id, user_id],
             )?;
+            if changed > 0 {
+                // 软删的记忆从向量索引移除（memories 行仍在，rowid 可查）。
+                tx.execute(
+                    "DELETE FROM vec_memories WHERE rowid = \n                     (SELECT rowid FROM memories WHERE id = ?1)",
+                    params![memory_id],
+                )?;
+            }
+            tx.commit()?;
             Ok(changed > 0)
         })
         .await
@@ -562,10 +639,19 @@ impl Store {
                 if created_id == old_id_for_update {
                     return Ok(false);
                 }
-                let changed = conn.execute(
+                let tx = conn.transaction()?;
+                let changed = tx.execute(
                     "UPDATE memories SET active = 0, superseded_by = ?1, superseded_at = ?2 \n                     WHERE id = ?3 AND user_id = ?4",
                     params![created_id, now_iso(), old_id_for_update, user_id],
                 )?;
+                if changed > 0 {
+                    // 被取代的旧记忆从向量索引移除（memories 行保留可回溯）。
+                    tx.execute(
+                        "DELETE FROM vec_memories WHERE rowid = \n                         (SELECT rowid FROM memories WHERE id = ?1)",
+                        params![old_id_for_update],
+                    )?;
+                }
+                tx.commit()?;
                 Ok(changed > 0)
             })
             .await?;
@@ -600,8 +686,8 @@ impl Store {
                     |row| {
                         Ok((
                             MemoryRow::from_row(row)?,
-                            row.get::<_, i64>(8)? != 0,
-                            row.get(9)?,
+                            row.get::<_, i64>(7)? != 0,
+                            row.get(8)?,
                         ))
                     },
                 )?
@@ -802,7 +888,6 @@ struct MemoryRow {
     created_at: String,
     #[allow(dead_code)]
     last_seen_at: String,
-    embedding: Vec<u8>,
 }
 
 impl MemoryRow {
@@ -816,7 +901,6 @@ impl MemoryRow {
             subject: row.get(4)?,
             created_at: row.get(5)?,
             last_seen_at: row.get(6)?,
-            embedding: row.get(7)?,
         })
     }
 }
@@ -898,21 +982,22 @@ fn create_memory_sync(conn: &mut Connection, cfg: &Config, new: NewMemory) -> Re
         return touch_memory(conn, cfg, &id, old_level, level, &now);
     }
 
-    // 近乎完全相同的规范化表述用极高阈值合并（默认 0.995），
-    // 避免把“喜欢 X”和“不喜欢 X”误合并。
-    let candidates: Vec<(String, i64, Vec<u8>)> = {
-        let mut stmt = conn.prepare(
-            "SELECT id, level, embedding FROM memories WHERE user_id = ?1 AND active = 1 \n             AND subject = ?2 AND kind = ?3",
-        )?;
-        let rows = stmt
-            .query_map(params![new.user_id, subject, new.kind], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })?
-            .collect::<std::result::Result<_, _>>()?;
-        rows
-    };
-    for (id, old_level, blob) in candidates {
-        if dot(&blob_to_vec(&blob), &new.embedding) >= cfg.memory_duplicate_threshold {
+    // 近乎完全相同的表述用极高阈值合并（默认 0.995）：在 vec0 里查同 user/subject/kind
+    // 的最近一条，余弦 ≥ 阈值即视为重复、并入旧记忆（避免把“喜欢 X”和“不喜欢 X”误并）。
+    let near: Option<(i64, f64)> = conn
+        .query_row(
+            "SELECT rowid, distance FROM vec_memories \n             WHERE embedding MATCH ?1 AND user_id = ?2 AND subject = ?3 AND kind = ?4 AND k = 1",
+            params![vec_to_blob_f32(&new.embedding), new.user_id, subject, new.kind],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if let Some((rowid, distance)) = near {
+        if 1.0 - distance >= cfg.memory_duplicate_threshold as f64 {
+            let (id, old_level): (String, i64) = conn.query_row(
+                "SELECT id, level FROM memories WHERE rowid = ?1",
+                params![rowid],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
             return touch_memory(conn, cfg, &id, old_level, level, &now);
         }
     }
@@ -938,7 +1023,7 @@ fn create_memory_sync(conn: &mut Connection, cfg: &Config, new: NewMemory) -> Re
     )?;
     // 追加式：不写 expires_at（列保留兼容旧库，新记忆恒为 NULL = 永不过期）。
     tx.execute(
-        "INSERT INTO memories (id, user_id, text, kind, level, subject, \n         embedding, fingerprint, source, created_at, last_seen_at) \n         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
+        "INSERT INTO memories (id, user_id, text, kind, level, subject, \n         fingerprint, source, created_at, last_seen_at) \n         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
         params![
             memory_id,
             new.user_id,
@@ -946,10 +1031,20 @@ fn create_memory_sync(conn: &mut Connection, cfg: &Config, new: NewMemory) -> Re
             new.kind,
             level,
             subject,
-            vec_to_blob(&new.embedding),
             fingerprint,
             new.source,
             now,
+        ],
+    )?;
+    // 向量只存 vec0 一份；rowid 对应刚插入的 memories 行。
+    tx.execute(
+        "INSERT INTO vec_memories(rowid, embedding, user_id, subject, kind) \n         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            tx.last_insert_rowid(),
+            vec_to_blob_f32(&new.embedding),
+            new.user_id,
+            subject,
+            new.kind,
         ],
     )?;
     for (name, entity_type, key) in &safe_entities {
@@ -1157,11 +1252,13 @@ pub fn cli_show_memory(cfg: &Config, id: &str) -> Result<Option<MemoryDetail>> {
 /// 找不到或已是失效状态返回 None。是写操作，用可写连接（WAL + busy_timeout
 /// 与运行中的服务并发安全）。
 pub fn cli_forget_memory(cfg: &Config, id: &str, purge: bool) -> Result<Option<String>> {
+    register_vec_extension();
     let conn = Connection::open(&cfg.db_path)
         .with_context(|| format!("无法打开数据库 {}", cfg.db_path))?;
     conn.pragma_update(None, "busy_timeout", 5000)?;
     // 硬删要靠 FK 级联清掉 memory_entities/memory_links。
     conn.pragma_update(None, "foreign_keys", true)?;
+    ensure_vec_table(&conn, cfg.embedding_dimensions)?;
 
     // 硬删可作用于任意记忆；软删只针对活跃记忆。
     let full_id = match resolve_memory_id(&conn, id, !purge)? {
@@ -1174,6 +1271,11 @@ pub fn cli_forget_memory(cfg: &Config, id: &str, purge: bool) -> Result<Option<S
         |row| row.get(0),
     )?;
 
+    // 先删向量索引（趁 memories 行还在、rowid 可查；硬删后 rowid 会被复用污染新记忆）。
+    conn.execute(
+        "DELETE FROM vec_memories WHERE rowid = (SELECT rowid FROM memories WHERE id = ?1)",
+        params![full_id],
+    )?;
     if purge {
         conn.execute("DELETE FROM memories WHERE id = ?1", params![full_id])?;
     } else {
@@ -1268,19 +1370,25 @@ pub fn cli_stats(cfg: &Config, user: Option<&str>) -> Result<MemoryStats> {
 /// CLI `memory forget --all`：软删所有活跃记忆（active=0），或 purge 硬删全部。
 /// 返回受影响条数。危险操作，调用方（cli）负责 --yes 确认。
 pub fn cli_forget_all(cfg: &Config, purge: bool) -> Result<usize> {
+    register_vec_extension();
     let conn = Connection::open(&cfg.db_path)
         .with_context(|| format!("无法打开数据库 {}", cfg.db_path))?;
     conn.pragma_update(None, "busy_timeout", 5000)?;
     conn.pragma_update(None, "foreign_keys", true)?;
+    ensure_vec_table(&conn, cfg.embedding_dimensions)?;
 
     let affected = if purge {
-        // WHERE 1 = ?1 恒真，既删全部又避免空参数数组的类型推断歧义。
+        // 清空向量索引 + 硬删全部记忆（WHERE 1 = ?1 恒真，避免空参数类型推断歧义）。
+        conn.execute("DELETE FROM vec_memories", [])?;
         conn.execute("DELETE FROM memories WHERE 1 = ?1", params![1_i64])?
     } else {
-        conn.execute(
+        // 软删全部活跃记忆 → 全部移出向量索引（vec0 只存活跃记忆）。
+        let n = conn.execute(
             "UPDATE memories SET active = 0, forgotten_at = ?1 WHERE active = 1",
             params![now_iso()],
-        )?
+        )?;
+        conn.execute("DELETE FROM vec_memories", [])?;
+        n
     };
     Ok(affected)
 }
@@ -1292,6 +1400,8 @@ mod tests {
     fn test_config(db_path: &str) -> Arc<Config> {
         let mut cfg = Config::from_env().unwrap();
         cfg.db_path = db_path.to_string();
+        // 测试向量是 4 维，vec0 表须按同一维度建。
+        cfg.embedding_dimensions = 4;
         Arc::new(cfg)
     }
 
@@ -1447,6 +1557,59 @@ mod tests {
         }
         assert!(store.forget_memory("u1".into(), new.id.clone()).await.unwrap());
         assert!(!store.forget_memory("u1".into(), new.id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn migrates_legacy_embedding_to_vec0() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.db");
+        let path_str = path.to_str().unwrap().to_string();
+        // 造一个"旧库"：memories 带 embedding 列 + 一条记忆，没有 vec0。
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE users (id TEXT PRIMARY KEY, created_at TEXT NOT NULL);
+                 CREATE TABLE memories (
+                   id TEXT PRIMARY KEY, user_id TEXT NOT NULL, text TEXT NOT NULL,
+                   kind TEXT NOT NULL, level INTEGER NOT NULL, subject TEXT NOT NULL DEFAULT 'user',
+                   embedding BLOB NOT NULL, fingerprint TEXT NOT NULL, source TEXT NOT NULL,
+                   active INTEGER NOT NULL DEFAULT 1, repetitions INTEGER NOT NULL DEFAULT 1,
+                   access_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL,
+                   last_seen_at TEXT NOT NULL, last_accessed_at TEXT, expires_at TEXT,
+                   forgotten_at TEXT, superseded_by TEXT, superseded_at TEXT
+                 );",
+            )
+            .unwrap();
+            conn.execute("INSERT INTO users (id, created_at) VALUES ('u1', 't')", [])
+                .unwrap();
+            conn.execute(
+                "INSERT INTO memories (id, user_id, text, kind, level, subject, embedding, \
+                 fingerprint, source, created_at, last_seen_at) \
+                 VALUES ('m1', 'u1', '旧记忆', 'fact', 5, 'user', ?1, 'fp', 'test', 't', 't')",
+                params![vec_to_blob(&unit(1.0, 0.0, 0.0, 0.0))],
+            )
+            .unwrap();
+        }
+        // Store::open 触发迁移：向量回填进 vec0，embedding 列被移除。
+        let store = Store::open(test_config(&path_str)).unwrap();
+        let results = store
+            .search_memories("u1".into(), unit(1.0, 0.0, 0.0, 0.0), None, None)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].text, "旧记忆");
+        // embedding 列应已不存在。
+        let has_col = store
+            .run(|conn, _| {
+                Ok(conn.query_row(
+                    "SELECT count(*) FROM pragma_table_info('memories') WHERE name = 'embedding'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(has_col, 0);
     }
 
     #[tokio::test]

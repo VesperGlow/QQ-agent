@@ -29,6 +29,8 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 dom_smoothie = "0.18"
 htmd = "0.5"
 rusqlite = { version = "0.40", features = ["bundled"] }
+# 向量检索：进程内注册 vec0 虚拟表（KNN + 余弦），把向量搜索/近重下沉到 SQL。
+sqlite-vec = "0.1.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
