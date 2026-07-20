@@ -18,16 +18,16 @@ const USAGE: &str = "\
   -u, --user <id>   只看某个用户（如 qq:c2c:xxxx）
   -n, --limit N     最多列出多少条（默认 200）
   -a, --all         包含已失效的记忆（被遗忘/被取代）
-  -j, --json        输出 JSON（含 id / 时间戳 / 过期时间等完整字段）
+  -j, --json        输出 JSON（含 id / 时间戳等完整字段）
 
 选项（forget）：
   -a, --all         删除全部记忆（必须配 --yes）
       --purge       改为硬删除（彻底 DELETE + 级联清实体链接，不可逆，需 --yes）
   -y, --yes         确认危险操作（--all 或 --purge 时必需）
 
-show   按 id（或前缀）打印单条完整明细：文本、等级、实体、时间线、状态。
+show   按 id（或前缀）打印单条完整明细：文本、实体、时间线、状态。
 forget 默认软删除（active=0，库里留痕、检索不到）；可一次给多个 id/前缀。
-stats  按活跃/失效、等级、类型汇总条数（只读），删完核对用。";
+stats  按活跃/失效、类型汇总条数（只读），删完核对用。";
 
 /// 分发子命令。args 不含程序名（即 std::env::args().skip(1)）。
 pub fn run(cfg: &Config, args: &[String]) -> Result<()> {
@@ -112,8 +112,8 @@ fn memory_list(cfg: &Config, args: &[String]) -> Result<()> {
         let when = row.created_at.get(0..19).unwrap_or(&row.created_at);
         let text = truncate(&row.text, 60);
         let mut line = format!(
-            "{flag} {when}  L{:<2} {:<11} ×{}",
-            row.level, row.kind, row.repetitions
+            "{flag} {when}  {:<11} ×{}",
+            row.kind, row.repetitions
         );
         // 多用户时才附用户尾号区分；id 只显示 8 位前缀（show/forget 认前缀）。
         if per_row_user {
@@ -140,16 +140,12 @@ fn memory_show(cfg: &Config, args: &[String]) -> Result<()> {
     println!("id         {}", m.id);
     println!("user       {}", m.user_id);
     println!("状态       {status}（subject={}, source={}）", m.subject, m.source);
-    println!("分类/等级  {} / L{}", m.kind, m.level);
+    println!("分类       {}", m.kind);
     println!("计数       重复 ×{}，被检索 ×{}", m.repetitions, m.access_count);
     println!("创建       {}", m.created_at);
     println!("最近提及   {}", m.last_seen_at);
     if let Some(v) = &m.last_accessed_at {
         println!("最近检索   {v}");
-    }
-    match &m.expires_at {
-        Some(v) => println!("过期       {v}（旧数据遗留，追加式下已不生效）"),
-        None => println!("过期       永不（追加式存储，不按时间遗忘）"),
     }
     if let Some(v) = &m.forgotten_at {
         println!("遗忘于     {v}");
@@ -264,13 +260,6 @@ fn memory_stats(cfg: &Config, args: &[String]) -> Result<()> {
         println!("（无活跃记忆）");
         return Ok(());
     }
-    let levels = s
-        .by_level
-        .iter()
-        .map(|(l, c)| format!("L{l}×{c}"))
-        .collect::<Vec<_>>()
-        .join("  ");
-    println!("等级：{levels}");
     let kinds = s
         .by_kind
         .iter()
