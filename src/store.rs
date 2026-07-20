@@ -1141,30 +1141,7 @@ pub fn cli_list_memories(cfg: &Config, filter: &ListFilter) -> Result<Vec<Memory
     Ok(rows)
 }
 
-/// CLI `memory show` 的完整明细（不含向量）。
-#[derive(Debug, Serialize)]
-pub struct MemoryDetail {
-    pub id: String,
-    pub user_id: String,
-    pub subject: String,
-    pub kind: String,
-    pub level: i64,
-    pub source: String,
-    pub active: bool,
-    pub repetitions: i64,
-    pub access_count: i64,
-    pub created_at: String,
-    pub last_seen_at: String,
-    pub last_accessed_at: Option<String>,
-    pub expires_at: Option<String>,
-    pub forgotten_at: Option<String>,
-    pub superseded_by: Option<String>,
-    pub superseded_at: Option<String>,
-    pub entities: Vec<EntityView>,
-    pub text: String,
-}
-
-/// show/forget 按 id 前缀解析（像 git 短哈希）。完整 id 精确命中优先；多前缀命中
+/// delete 按 id 前缀解析（像 git 短哈希）。完整 id 精确命中优先；多前缀命中
 /// 报歧义（提示多给几位）；无命中返回 None。active_only 时只在活跃记忆里找。
 fn resolve_memory_id(conn: &Connection, input: &str, active_only: bool) -> Result<Option<String>> {
     let sql = if active_only {
@@ -1187,83 +1164,16 @@ fn resolve_memory_id(conn: &Connection, input: &str, active_only: bool) -> Resul
     }
 }
 
-/// CLI 用：按 id（或前缀）取单条记忆的完整明细 + 实体。只读打开。找不到返回 None。
-pub fn cli_show_memory(cfg: &Config, id: &str) -> Result<Option<MemoryDetail>> {
-    let conn = Connection::open(&cfg.db_path)
-        .with_context(|| format!("无法打开数据库 {}", cfg.db_path))?;
-    conn.pragma_update(None, "busy_timeout", 5000)?;
-    conn.pragma_update(None, "query_only", true)?;
-
-    let full_id = match resolve_memory_id(&conn, id, false)? {
-        Some(full) => full,
-        None => return Ok(None),
-    };
-
-    let detail = conn
-        .query_row(
-            "SELECT id, user_id, subject, kind, level, source, active, repetitions, \
-             access_count, created_at, last_seen_at, last_accessed_at, expires_at, \
-             forgotten_at, superseded_by, superseded_at, text \
-             FROM memories WHERE id = ?1",
-            params![full_id],
-            |row| {
-                Ok(MemoryDetail {
-                    id: row.get(0)?,
-                    user_id: row.get(1)?,
-                    subject: row.get(2)?,
-                    kind: row.get(3)?,
-                    level: row.get(4)?,
-                    source: row.get(5)?,
-                    active: row.get::<_, i64>(6)? != 0,
-                    repetitions: row.get(7)?,
-                    access_count: row.get(8)?,
-                    created_at: row.get(9)?,
-                    last_seen_at: row.get(10)?,
-                    last_accessed_at: row.get(11)?,
-                    expires_at: row.get(12)?,
-                    forgotten_at: row.get(13)?,
-                    superseded_by: row.get(14)?,
-                    superseded_at: row.get(15)?,
-                    entities: Vec::new(),
-                    text: row.get(16)?,
-                })
-            },
-        )
-        .optional()?;
-
-    let Some(mut detail) = detail else {
-        return Ok(None);
-    };
-
-    let mut stmt = conn.prepare(
-        "SELECT e.name, e.type FROM memory_entities me \
-         JOIN entities e ON e.key = me.entity_key WHERE me.memory_id = ?1",
-    )?;
-    detail.entities = stmt
-        .query_map(params![id], |erow| {
-            Ok(EntityView {
-                name: erow.get(0)?,
-                kind: erow.get(1)?,
-            })
-        })?
-        .collect::<std::result::Result<_, _>>()?;
-    Ok(Some(detail))
-}
-
-/// CLI `memory forget <id>`：软删除一条记忆（active=0），返回被删的文本；
-/// 找不到或已是失效状态返回 None。是写操作，用可写连接（WAL + busy_timeout
-/// 与运行中的服务并发安全）。
-pub fn cli_forget_memory(cfg: &Config, id: &str, purge: bool) -> Result<Option<String>> {
+/// CLI `memory delete <id>`：软删除一条活跃记忆（active=0 + 移出 vec0），返回被删文本；
+/// 找不到活跃记忆返回 None。memories 与 vec0 放同一事务；WAL + busy_timeout 与服务并发安全。
+pub fn cli_delete_memory(cfg: &Config, id: &str) -> Result<Option<String>> {
     register_vec_extension();
     let mut conn = Connection::open(&cfg.db_path)
         .with_context(|| format!("无法打开数据库 {}", cfg.db_path))?;
     conn.pragma_update(None, "busy_timeout", 5000)?;
-    // 硬删要靠 FK 级联清掉 memory_entities/memory_links。
-    conn.pragma_update(None, "foreign_keys", true)?;
     ensure_vec_table(&conn, cfg.embedding_dimensions)?;
 
-    // 硬删可作用于任意记忆；软删只针对活跃记忆。
-    let full_id = match resolve_memory_id(&conn, id, !purge)? {
+    let full_id = match resolve_memory_id(&conn, id, true)? {
         Some(full) => full,
         None => return Ok(None),
     };
@@ -1275,19 +1185,14 @@ pub fn cli_forget_memory(cfg: &Config, id: &str, purge: bool) -> Result<Option<S
 
     // memories 与 vec0 的改动放同一事务，避免中途崩溃留下"半删"的不一致状态。
     let tx = conn.transaction()?;
-    // 先删向量索引（趁 memories 行还在、rowid 可查；硬删后 rowid 会被复用污染新记忆）。
     tx.execute(
         "DELETE FROM vec_memories WHERE rowid = (SELECT rowid FROM memories WHERE id = ?1)",
         params![full_id],
     )?;
-    if purge {
-        tx.execute("DELETE FROM memories WHERE id = ?1", params![full_id])?;
-    } else {
-        tx.execute(
-            "UPDATE memories SET active = 0, forgotten_at = ?1 WHERE id = ?2",
-            params![now_iso(), full_id],
-        )?;
-    }
+    tx.execute(
+        "UPDATE memories SET active = 0, forgotten_at = ?1 WHERE id = ?2",
+        params![now_iso(), full_id],
+    )?;
     tx.commit()?;
     Ok(Some(text))
 }
@@ -1372,33 +1277,23 @@ pub fn cli_stats(cfg: &Config, user: Option<&str>) -> Result<MemoryStats> {
     })
 }
 
-/// CLI `memory forget --all`：软删所有活跃记忆（active=0），或 purge 硬删全部。
-/// 返回受影响条数。危险操作，调用方（cli）负责 --yes 确认。
-pub fn cli_forget_all(cfg: &Config, purge: bool) -> Result<usize> {
+/// CLI `memory delete --all`：软删所有活跃记忆（active=0）+ 清空 vec0，返回条数。
+/// 危险操作，调用方（cli）负责 --yes 确认。memories 与 vec0 同一事务。
+pub fn cli_delete_all(cfg: &Config) -> Result<usize> {
     register_vec_extension();
     let mut conn = Connection::open(&cfg.db_path)
         .with_context(|| format!("无法打开数据库 {}", cfg.db_path))?;
     conn.pragma_update(None, "busy_timeout", 5000)?;
-    conn.pragma_update(None, "foreign_keys", true)?;
     ensure_vec_table(&conn, cfg.embedding_dimensions)?;
 
-    // memories 与 vec0 同一事务，避免半删不一致。
     let tx = conn.transaction()?;
-    let affected = if purge {
-        // 清空向量索引 + 硬删全部记忆（WHERE 1 = ?1 恒真，避免空参数类型推断歧义）。
-        tx.execute("DELETE FROM vec_memories", [])?;
-        tx.execute("DELETE FROM memories WHERE 1 = ?1", params![1_i64])?
-    } else {
-        // 软删全部活跃记忆 → 全部移出向量索引（vec0 只存活跃记忆）。
-        let n = tx.execute(
-            "UPDATE memories SET active = 0, forgotten_at = ?1 WHERE active = 1",
-            params![now_iso()],
-        )?;
-        tx.execute("DELETE FROM vec_memories", [])?;
-        n
-    };
+    let n = tx.execute(
+        "UPDATE memories SET active = 0, forgotten_at = ?1 WHERE active = 1",
+        params![now_iso()],
+    )?;
+    tx.execute("DELETE FROM vec_memories", [])?;
     tx.commit()?;
-    Ok(affected)
+    Ok(n)
 }
 
 #[cfg(test)]

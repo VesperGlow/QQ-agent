@@ -9,25 +9,19 @@ use crate::store::{self, ListFilter};
 const USAGE: &str = "\
 用法：
   mneme memory list [--user <id>] [--limit N] [--all] [--json]
-  mneme memory show <id> [--json]
-  mneme memory forget <id> [<id> ...] [--purge --yes]
-  mneme memory forget --all [--purge] --yes
+  mneme memory delete <id> [<id> ...]
+  mneme memory delete --all --yes
   mneme memory stats [--user <id>] [--json]
 
 选项（list）：
   -u, --user <id>   只看某个用户（如 qq:c2c:xxxx）
   -n, --limit N     最多列出多少条（默认 200）
-  -a, --all         包含已失效的记忆（被遗忘/被取代）
+  -a, --all         包含已失效的记忆（被删除/被取代）
   -j, --json        输出 JSON（含 id / 时间戳等完整字段）
 
-选项（forget）：
-  -a, --all         删除全部记忆（必须配 --yes）
-      --purge       改为硬删除（彻底 DELETE + 级联清实体链接，不可逆，需 --yes）
-  -y, --yes         确认危险操作（--all 或 --purge 时必需）
-
-show   按 id（或前缀）打印单条完整明细：文本、实体、时间线、状态。
-forget 默认软删除（active=0，库里留痕、检索不到）；可一次给多个 id/前缀。
-stats  按活跃/失效、类型汇总条数（只读），删完核对用。";
+delete 软删除：active=0 并移出向量索引（检索不到、库里留痕，list --all 仍可见）；
+       可一次给多个 id/前缀；--all 删全部活跃记忆、需 --yes 确认。
+stats  按活跃/失效、类型汇总条数（只读）。";
 
 /// 分发子命令。args 不含程序名（即 std::env::args().skip(1)）。
 pub fn run(cfg: &Config, args: &[String]) -> Result<()> {
@@ -45,8 +39,7 @@ pub fn run(cfg: &Config, args: &[String]) -> Result<()> {
 fn memory(cfg: &Config, args: &[String]) -> Result<()> {
     match args.first().map(String::as_str) {
         Some("list") => memory_list(cfg, &args[1..]),
-        Some("show") => memory_show(cfg, &args[1..]),
-        Some("forget") => memory_forget(cfg, &args[1..]),
+        Some("delete") => memory_delete(cfg, &args[1..]),
         Some("stats") => memory_stats(cfg, &args[1..]),
         Some(other) => bail!("未知 memory 子命令：{other}\n\n{USAGE}"),
         None => bail!("memory 需要一个动作\n\n{USAGE}"),
@@ -115,7 +108,7 @@ fn memory_list(cfg: &Config, args: &[String]) -> Result<()> {
             "{flag} {when}  {:<11} ×{}",
             row.kind, row.repetitions
         );
-        // 多用户时才附用户尾号区分；id 只显示 8 位前缀（show/forget 认前缀）。
+        // 多用户时才附用户尾号区分；id 只显示 8 位前缀（delete 认前缀）。
         if per_row_user {
             line.push_str(&format!("  [{}]", user_tail(&row.user_id)));
         }
@@ -123,58 +116,17 @@ fn memory_list(cfg: &Config, args: &[String]) -> Result<()> {
         println!("{line}");
     }
     let example = rows.first().map(|r| id_head(&r.id)).unwrap_or_default();
-    println!("\n（show/forget 用前缀即可，如 mneme memory show {example}）");
+    println!("\n（delete 用前缀即可，如 mneme memory delete {example}）");
     Ok(())
 }
 
-fn memory_show(cfg: &Config, args: &[String]) -> Result<()> {
-    let (id, as_json) = parse_id_and_json(args)?;
-    let Some(m) = store::cli_show_memory(cfg, &id)? else {
-        bail!("没有 id 为 {id} 的记忆");
-    };
-    if as_json {
-        println!("{}", serde_json::to_string_pretty(&m)?);
-        return Ok(());
-    }
-    let status = if m.active { "活跃" } else { "已失效" };
-    println!("id         {}", m.id);
-    println!("user       {}", m.user_id);
-    println!("状态       {status}（subject={}, source={}）", m.subject, m.source);
-    println!("分类       {}", m.kind);
-    println!("计数       重复 ×{}，被检索 ×{}", m.repetitions, m.access_count);
-    println!("创建       {}", m.created_at);
-    println!("最近提及   {}", m.last_seen_at);
-    if let Some(v) = &m.last_accessed_at {
-        println!("最近检索   {v}");
-    }
-    if let Some(v) = &m.forgotten_at {
-        println!("遗忘于     {v}");
-    }
-    if let Some(v) = &m.superseded_by {
-        println!("被取代为   {v}（superseded_at={}）", m.superseded_at.as_deref().unwrap_or("?"));
-    }
-    if !m.entities.is_empty() {
-        let joined = m
-            .entities
-            .iter()
-            .map(|e| format!("{}({})", e.name, e.kind))
-            .collect::<Vec<_>>()
-            .join("、");
-        println!("实体       {joined}");
-    }
-    println!("\n{}", m.text);
-    Ok(())
-}
-
-fn memory_forget(cfg: &Config, args: &[String]) -> Result<()> {
+fn memory_delete(cfg: &Config, args: &[String]) -> Result<()> {
     let mut ids: Vec<String> = Vec::new();
     let mut all = false;
-    let mut purge = false;
     let mut yes = false;
     for arg in args {
         match arg.as_str() {
             "--all" | "-a" => all = true,
-            "--purge" => purge = true,
             "--yes" | "-y" => yes = true,
             "--help" | "-h" => {
                 println!("{USAGE}");
@@ -191,33 +143,25 @@ fn memory_forget(cfg: &Config, args: &[String]) -> Result<()> {
             bail!("--all 不能和具体 id 混用");
         }
         if !yes {
-            let how = if purge { "硬删除（彻底 DELETE，不可逆）" } else { "软删除（active=0）" };
-            let extra = if purge { " --purge" } else { "" };
-            bail!("这会{how}全部记忆。确认请加 --yes：\n  mneme memory forget --all{extra} --yes");
+            bail!("这会软删除全部活跃记忆（active=0，list --all 仍可见）。确认请加 --yes：\n  mneme memory delete --all --yes");
         }
-        let n = store::cli_forget_all(cfg, purge)?;
-        let how = if purge { "硬删除" } else { "软删除（active=0，--all 仍可见）" };
-        println!("已{how} {n} 条记忆。");
+        let n = store::cli_delete_all(cfg)?;
+        println!("已软删除 {n} 条记忆（active=0，list --all 仍可见）。");
         return Ok(());
     }
 
     if ids.is_empty() {
         bail!("需要一个或多个记忆 id（或 --all）\n\n{USAGE}");
     }
-    // 硬删单条也不可逆，要 --yes。
-    if purge && !yes {
-        bail!("--purge 是不可逆硬删除，确认请加 --yes");
-    }
 
     let mut done = 0usize;
     for id in &ids {
-        match store::cli_forget_memory(cfg, id, purge) {
+        match store::cli_delete_memory(cfg, id) {
             Ok(Some(text)) => {
                 done += 1;
-                let how = if purge { "硬删除" } else { "已遗忘" };
-                println!("✓ {how} {id}：{}", truncate(&text, 80));
+                println!("✓ 已删除 {id}：{}", truncate(&text, 80));
             }
-            Ok(None) => println!("✗ 未找到{}记忆：{id}", if purge { "" } else { "活跃" }),
+            Ok(None) => println!("✗ 未找到活跃记忆：{id}"),
             // 前缀歧义等错误只影响这一条，不中断整批。
             Err(error) => println!("✗ {id}：{error}"),
         }
@@ -273,30 +217,6 @@ fn memory_stats(cfg: &Config, args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// 解析 `<id> [--json]`：第一个非选项参数当 id。
-fn parse_id_and_json(args: &[String]) -> Result<(String, bool)> {
-    let mut id: Option<String> = None;
-    let mut as_json = false;
-    for arg in args {
-        match arg.as_str() {
-            "--json" | "-j" => as_json = true,
-            "--help" | "-h" => {
-                println!("{USAGE}");
-                std::process::exit(0);
-            }
-            other if other.starts_with('-') => bail!("未知参数：{other}\n\n{USAGE}"),
-            other => {
-                if id.is_some() {
-                    bail!("只能指定一个 id");
-                }
-                id = Some(other.to_string());
-            }
-        }
-    }
-    let id = id.ok_or_else(|| anyhow!("需要一个记忆 id\n\n{USAGE}"))?;
-    Ok((id, as_json))
-}
-
 /// 按字符数截断并加省略号（避免在多字节字符中间切断）。
 fn truncate(text: &str, max_chars: usize) -> String {
     let flat = text.replace('\n', " ");
@@ -318,7 +238,7 @@ fn user_tail(value: &str) -> String {
     }
 }
 
-/// 记忆 id 取前 8 字符（UUID 前缀，个人库唯一性足够）；show/forget 认前缀。
+/// 记忆 id 取前 8 字符（UUID 前缀，个人库唯一性足够）；delete 认前缀。
 fn id_head(id: &str) -> String {
     id.chars().take(8).collect()
 }
