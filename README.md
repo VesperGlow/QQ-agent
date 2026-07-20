@@ -158,18 +158,17 @@ AI_THINKING_MAP_JSON='{"low":{"reasoning_effort":"low"},"high":{"reasoning_effor
 二进制（`mneme`）带参数即当作一次性子命令，直接查/改库并退出，不启动服务。运维排查时无需 sqlite、也不用管卷路径，`exec` 进容器即可：
 
 ```sh
-podman exec <容器> mneme memory list                 # 全部用户的活跃记忆（默认最多 200 条）
+podman exec <容器> mneme memory list                 # 活跃记忆（默认最多 200 条）
 podman exec <容器> mneme memory list --user qq:c2c:xxxx
-podman exec <容器> mneme memory list --all           # 含已失效（被删除/被取代）
 podman exec <容器> mneme memory list --limit 50 --json
-podman exec <容器> mneme memory delete <id> <id> ... # 软删除一条或多条（active=0，库里留痕）
-podman exec <容器> mneme memory delete --all --yes   # 软删除全部活跃记忆
+podman exec <容器> mneme memory delete <id> <id> ... # 硬删除一条或多条（不可逆）
+podman exec <容器> mneme memory delete --all --yes   # 硬删除全部记忆（不可逆）
 podman exec <容器> mneme memory stats                # 按活跃/类型汇总条数，删完核对
 ```
 
 > 容器名 `<容器>` 取决于你的 quadlet `ContainerName`（默认部署里是 `mneme`，即 `podman exec mneme mneme memory list`）。
 
-三个子命令：`list` 看、`stats` 数、`delete` 删。`list`/`stats` 只读打开（`query_only`），只查 `memories` 等普通表、不碰 vec0，与运行中的服务共享同一 WAL 库、互不影响；`delete` 是写操作，把 `memories`（`active=0`）与 vec0 向量索引的移除放在同一事务里（WAL + busy_timeout 与服务并发安全）。`list` 默认文本表格每行为 `✓ 时间 kind ×重复次数 id前缀 摘要`（单用户时用户列省略、只在标题带一次 `user=`，多用户才逐行加 `[尾号]`），`--json` 输出全字段（含完整 `id` 与时间戳）；`delete` 认 id 前缀（像 git 短哈希，如 `memory delete 7642e9b1`），多条命中会提示多给几位。`delete` 一律软删除：置 `active=0` 并移出向量索引，检索不到但库里留痕、`list --all` 仍可见（保留可审计留痕、不做硬删）；可一次给多个 id，`--all` 删全部活跃记忆、必须配 `--yes` 确认（moods 情绪时间线不受影响）。`stats` 是只读汇总（活跃/失效计数、按类型分布、时间跨度），只给数不给内容。
+三个子命令：`list` 看、`stats` 数、`delete` 删。`list`/`stats` 只读打开（`query_only`），只查 `memories` 等普通表、不碰 vec0，与运行中的服务共享同一 WAL 库、互不影响；`list` 只列活跃记忆，默认文本表格每行为 `时间 kind ×重复次数 id前缀 摘要`（单用户时用户列省略、只在标题带一次 `user=`，多用户才逐行加 `[尾号]`），`--json` 输出要点字段。`delete` 是写操作、**硬删除**：彻底 `DELETE` 记忆行 + FK 级联清实体链接 + 移出 vec0 向量索引，`memories` 与 vec0 放同一事务（WAL + busy_timeout 与服务并发安全），**不可逆**；认 id 前缀（像 git 短哈希，如 `memory delete 7642e9b1`），可一次给多个 id，`--all` 删全部、必须配 `--yes` 确认（moods 情绪时间线不受影响）。`stats` 是只读汇总（活跃/失效计数、按类型分布、时间跨度），只给数不给内容。
 
 ## 对话 API
 

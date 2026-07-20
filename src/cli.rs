@@ -8,7 +8,7 @@ use crate::store::{self, ListFilter};
 
 const USAGE: &str = "\
 用法：
-  mneme memory list [--user <id>] [--limit N] [--all] [--json]
+  mneme memory list [--user <id>] [--limit N] [--json]
   mneme memory delete <id> [<id> ...]
   mneme memory delete --all --yes
   mneme memory stats [--user <id>] [--json]
@@ -16,11 +16,10 @@ const USAGE: &str = "\
 选项（list）：
   -u, --user <id>   只看某个用户（如 qq:c2c:xxxx）
   -n, --limit N     最多列出多少条（默认 200）
-  -a, --all         包含已失效的记忆（被删除/被取代）
-  -j, --json        输出 JSON（含 id / 时间戳等完整字段）
+  -j, --json        输出 JSON
 
-delete 软删除：active=0 并移出向量索引（检索不到、库里留痕，list --all 仍可见）；
-       可一次给多个 id/前缀；--all 删全部活跃记忆、需 --yes 确认。
+delete 硬删除：彻底 DELETE + 级联清实体链接 + 移出向量索引，不可逆；可一次给多个
+       id/前缀；--all 删全部、需 --yes 确认。
 stats  按活跃/失效、类型汇总条数（只读）。";
 
 /// 分发子命令。args 不含程序名（即 std::env::args().skip(1)）。
@@ -49,7 +48,6 @@ fn memory(cfg: &Config, args: &[String]) -> Result<()> {
 fn memory_list(cfg: &Config, args: &[String]) -> Result<()> {
     let mut filter = ListFilter {
         user_id: None,
-        include_inactive: false,
         limit: 200,
     };
     let mut as_json = false;
@@ -57,7 +55,6 @@ fn memory_list(cfg: &Config, args: &[String]) -> Result<()> {
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
-            "--all" | "-a" => filter.include_inactive = true,
             "--json" | "-j" => as_json = true,
             "--user" | "-u" => {
                 let value = it.next().ok_or_else(|| anyhow!("--user 需要一个值"))?;
@@ -88,26 +85,21 @@ fn memory_list(cfg: &Config, args: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    let scope = if filter.include_inactive { "（含已失效）" } else { "" };
     // 单人库（或已按用户过滤）时不逐行重复用户，只在标题里带一次。
     let users: std::collections::BTreeSet<&str> = rows.iter().map(|r| r.user_id.as_str()).collect();
     let per_row_user = filter.user_id.is_none() && users.len() > 1;
     match &filter.user_id {
-        Some(uid) => println!("共 {} 条{}，user={uid}：", rows.len(), scope),
+        Some(uid) => println!("共 {} 条，user={uid}：", rows.len()),
         None if users.len() == 1 => {
-            println!("共 {} 条{}，user={}：", rows.len(), scope, users.iter().next().unwrap())
+            println!("共 {} 条，user={}：", rows.len(), users.iter().next().unwrap())
         }
-        None => println!("共 {} 条{}（{} 个用户）：", rows.len(), scope, users.len()),
+        None => println!("共 {} 条（{} 个用户）：", rows.len(), users.len()),
     }
     for row in &rows {
-        // active 用 ✓/✗，日期只留到秒，text 放最后免去 CJK 等宽对齐问题。
-        let flag = if row.active { '✓' } else { '✗' };
+        // 日期只留到秒，text 放最后免去 CJK 等宽对齐问题。
         let when = row.created_at.get(0..19).unwrap_or(&row.created_at);
         let text = truncate(&row.text, 60);
-        let mut line = format!(
-            "{flag} {when}  {:<11} ×{}",
-            row.kind, row.repetitions
-        );
+        let mut line = format!("{when}  {:<11} ×{}", row.kind, row.repetitions);
         // 多用户时才附用户尾号区分；id 只显示 8 位前缀（delete 认前缀）。
         if per_row_user {
             line.push_str(&format!("  [{}]", user_tail(&row.user_id)));
@@ -143,10 +135,10 @@ fn memory_delete(cfg: &Config, args: &[String]) -> Result<()> {
             bail!("--all 不能和具体 id 混用");
         }
         if !yes {
-            bail!("这会软删除全部活跃记忆（active=0，list --all 仍可见）。确认请加 --yes：\n  mneme memory delete --all --yes");
+            bail!("这会硬删除全部记忆（彻底 DELETE，不可逆）。确认请加 --yes：\n  mneme memory delete --all --yes");
         }
         let n = store::cli_delete_all(cfg)?;
-        println!("已软删除 {n} 条记忆（active=0，list --all 仍可见）。");
+        println!("已删除 {n} 条记忆。");
         return Ok(());
     }
 
@@ -161,7 +153,7 @@ fn memory_delete(cfg: &Config, args: &[String]) -> Result<()> {
                 done += 1;
                 println!("✓ 已删除 {id}：{}", truncate(&text, 80));
             }
-            Ok(None) => println!("✗ 未找到活跃记忆：{id}"),
+            Ok(None) => println!("✗ 未找到记忆：{id}"),
             // 前缀歧义等错误只影响这一条，不中断整批。
             Err(error) => println!("✗ {id}：{error}"),
         }
