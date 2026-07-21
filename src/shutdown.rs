@@ -39,6 +39,11 @@ impl Signal {
 }
 
 impl Listener {
+    /// 非阻塞查询：停机信号是否已触发。用于长循环里逐步自检、提前收尾。
+    pub fn is_triggered(&self) -> bool {
+        *self.rx.borrow()
+    }
+
     pub async fn wait(mut self) {
         // 发送端常驻 Signal；即使被丢弃，changed 返回 Err 也视为该停了。
         while !*self.rx.borrow() {

@@ -1,7 +1,7 @@
 //! 对话编排：检索记忆 → 组装上下文 → 工具循环 → 落库/评级/摘要。
 
-use std::sync::Arc;
-use std::sync::OnceLock;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
@@ -283,6 +283,21 @@ struct MemoryOp {
     entities: Vec<EntityView>,
 }
 
+/// RAII：巩固进行期间在 `consolidating` 集合里占位，Drop（含 `?` 提前返回、panic）
+/// 时自动释放，保证不会因异常路径把会话键永久留在集合里挡死后续巩固。
+struct InFlightRelease {
+    set: Arc<Mutex<HashSet<String>>>,
+    key: String,
+}
+
+impl Drop for InFlightRelease {
+    fn drop(&mut self) {
+        // 即便锁被 poison 也要把键取出来释放，否则该会话会被永久挡住不再巩固。
+        let mut set = self.set.lock().unwrap_or_else(|p| p.into_inner());
+        set.remove(&self.key);
+    }
+}
+
 #[derive(Clone)]
 pub struct Agent {
     cfg: Arc<Config>,
@@ -293,6 +308,10 @@ pub struct Agent {
     mcp: Arc<McpManager>,
     fetcher: Arc<Fetcher>,
     pending: Pending,
+    /// 正在巩固的会话键集合（`user_id\u{1f}conversation_id`）。per-turn 巩固与
+    /// 尾巴 flush 可能同时命中同一会话，用它保证同一会话同一时刻只有一个巩固在跑，
+    /// 避免重复调用记忆模型、重复记录情绪。
+    consolidating: Arc<Mutex<HashSet<String>>>,
 }
 
 impl Agent {
@@ -316,6 +335,7 @@ impl Agent {
             mcp,
             fetcher,
             pending,
+            consolidating: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -743,6 +763,23 @@ impl Agent {
         window: i64,
         min_batch: usize,
     ) {
+        // 同一会话同一时刻只允许一个巩固：per-turn 与 flush 在 idle 边界上可能撞车，
+        // 后到者直接跳过（其未巩固消息会在下一次巩固里连同处理，水位线不丢）。
+        let key = format!("{user_id}\u{1f}{conversation_id}");
+        {
+            let mut inflight = match self.consolidating.lock() {
+                Ok(inflight) => inflight,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if !inflight.insert(key.clone()) {
+                return;
+            }
+        }
+        let _release = InFlightRelease {
+            set: self.consolidating.clone(),
+            key,
+        };
+
         let result: Result<()> = async {
             let pending = self
                 .store
@@ -757,7 +794,7 @@ impl Agent {
             if pending.messages.len() < min_batch {
                 return Ok(());
             }
-            let saved = self.consolidate_batch(user_id, &pending.messages).await?;
+            let (saved, moods) = self.consolidate_batch(user_id, &pending.messages).await?;
             tracing::info!(
                 "记忆巩固完成 convo={} 压缩{}条消息 新增/更新{}条记忆",
                 conversation_id.chars().take(12).collect::<String>(),
@@ -765,7 +802,7 @@ impl Agent {
                 saved,
             );
             // 仅在整批成功后推进水位线；失败则水位线不动、下轮连同本批重跑
-            // （create_memory 的指纹/近似去重会挡住重复）。
+            // （create_memory 的指纹/近似去重会挡住记忆重复）。
             self.store
                 .advance_memory_watermark(
                     user_id.to_string(),
@@ -773,11 +810,28 @@ impl Agent {
                     pending.max_seq,
                 )
                 .await?;
+            // 情绪没有去重键，必须等水位线真正推进后再落库：这样即便本批因水位线推进
+            // 失败而整体重跑，情绪也只在成功的那一次记录一遍，不会重复计入趋势。
+            self.record_moods(user_id, moods).await;
             Ok(())
         }
         .await;
         if let Err(error) = result {
             tracing::warn!("记忆巩固失败：{error:#}");
+        }
+    }
+
+    /// 把巩固批次里抽出的情绪落库（best-effort，失败只告警）。
+    async fn record_moods(&self, user_id: &str, moods: Vec<(String, i64, String)>) {
+        for (label, valence, note) in moods {
+            tracing::info!("记录情绪 {label} valence={valence}");
+            if let Err(error) = self
+                .store
+                .record_mood(user_id.to_string(), label, valence, note)
+                .await
+            {
+                tracing::warn!("记录情绪失败：{error:#}");
+            }
         }
     }
 
@@ -800,12 +854,13 @@ impl Agent {
                 _ = ticker.tick() => {}
             }
             let _guard = self.pending.guard();
-            self.flush_idle_once().await;
+            self.flush_idle_once(&shutdown).await;
         }
     }
 
-    /// 扫描并 flush 一轮空闲会话的尾巴。
-    async fn flush_idle_once(&self) {
+    /// 扫描并 flush 一轮空闲会话的尾巴。收到停机信号即在会话间隙提前收尾，
+    /// 避免优雅停机被一整批（最多 100 个会话 × 记忆模型调用）拖住。
+    async fn flush_idle_once(&self, shutdown: &Listener) {
         let idle_before = (Utc::now()
             - chrono::Duration::seconds(self.cfg.memory_flush_idle_seconds as i64))
         .to_rfc3339_opts(chrono::SecondsFormat::Micros, false);
@@ -821,30 +876,46 @@ impl Agent {
             }
         };
         for (user_id, conversation_id) in convos {
+            if shutdown.is_triggered() {
+                break;
+            }
             // window=0：连仍在窗口内的尾巴一起取；min_batch=1：哪怕只剩一条也巩固。
             self.consolidate_pending(&user_id, &conversation_id, 0, 1).await;
         }
     }
 
     /// 对一批已结束的对话调用记忆模型：喂入相关已有记忆做 reconcile，产出 add/update
-    /// 操作与情绪，落库。返回落库的记忆条数。
-    async fn consolidate_batch(&self, user_id: &str, messages: &[ChatTurn]) -> Result<usize> {
-        let transcript = messages
+    /// 操作与情绪。记忆当场落库，情绪只解析并返回给调用方在水位线推进后再落库。
+    /// 返回 (落库的记忆条数, 待落库的情绪列表)。
+    async fn consolidate_batch(
+        &self,
+        user_id: &str,
+        messages: &[ChatTurn],
+    ) -> Result<(usize, Vec<(String, i64, String)>)> {
+        let render_turn = |m: &ChatTurn| {
+            format!(
+                "{}：{}",
+                if m.role == "user" { "用户" } else { "助手" },
+                m.content
+            )
+        };
+        // 完整 transcript 喂给记忆模型（要全上下文才能提炼准）。
+        let transcript = messages.iter().map(&render_turn).collect::<Vec<_>>().join("\n");
+
+        // 但用于「召回已有记忆」的查询只取最近若干轮：整段 transcript 常超过 embedding/
+        // 重排的输入上限而被截断，反而召不回真正相关的旧记忆，导致该 update 的变成新增。
+        // 取尾部而非全量，既贴近「本批最新变化」又稳定落在模型输入长度内。
+        const RETRIEVAL_TAIL_TURNS: usize = 12;
+        let tail_start = messages.len().saturating_sub(RETRIEVAL_TAIL_TURNS);
+        let retrieval_query = messages[tail_start..]
             .iter()
-            .map(|m| {
-                format!(
-                    "{}：{}",
-                    if m.role == "user" { "用户" } else { "助手" },
-                    m.content
-                )
-            })
+            .map(&render_turn)
             .collect::<Vec<_>>()
             .join("\n");
 
-        // 喂给模型的「已有记忆」用于判断重复与取代：按这段对话语义召回最相关的若干条，
         // 带上完整 id 供 update 引用。检索失败不致命，退化成纯新增。
         let existing = self
-            .retrieve(user_id, &transcript, Some(20))
+            .retrieve(user_id, &retrieval_query, Some(20))
             .await
             .unwrap_or_default();
         let existing_block = if existing.is_empty() {
@@ -890,6 +961,10 @@ impl Agent {
             Err(error) => return Err(error.into()),
         };
 
+        // update 只认真实出现在「已有记忆」清单里的 id：模型幻觉出的 id 若直接拿去
+        // supersede，会误删同一用户下另一条无关记忆（supersede 只按 id+user_id 定位）。
+        let existing_ids: HashSet<&str> = existing.iter().map(|m| m.id.as_str()).collect();
+
         let data = extract_json_object(&response.content)?;
         let mut ops: Vec<MemoryOp> = Vec::new();
         for item in data["memories"].as_array().unwrap_or(&Vec::new()).iter().take(8) {
@@ -910,11 +985,21 @@ impl Agent {
             } else {
                 "user"
             };
-            let is_update = item["op"].as_str() == Some("update");
             let old_memory_id = item["old_memory_id"]
                 .as_str()
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty());
+            // 只有 op=update 且 old_memory_id 确实在候选清单里时才当取代；否则降级为新增，
+            // 让指纹/近似去重去兜底，绝不拿未经核对的 id 去 supersede。
+            let (is_update, old_memory_id) = match old_memory_id {
+                Some(id)
+                    if item["op"].as_str() == Some("update")
+                        && existing_ids.contains(id.as_str()) =>
+                {
+                    (true, Some(id))
+                }
+                _ => (false, None),
+            };
             ops.push(MemoryOp {
                 is_update,
                 old_memory_id,
@@ -953,23 +1038,18 @@ impl Agent {
             }
         }
 
-        // 情绪与记忆同一批抽取（不额外调模型）；记录时间取巩固时刻，趋势按天算，误差可忽略。
+        // 情绪与记忆同一批抽取（不额外调模型）；此处只解析，落库交给调用方在水位线
+        // 推进成功后进行——moods 表没有去重键，若在这里就写，整批重跑会重复计入趋势。
+        let mut moods: Vec<(String, i64, String)> = Vec::new();
         if self.cfg.mood_tracking_enabled {
             for item in data["moods"].as_array().unwrap_or(&Vec::new()).iter().take(3) {
-                if let Some((label, valence, note)) = parse_mood(item) {
-                    tracing::info!("记录情绪 {label} valence={valence}");
-                    if let Err(error) = self
-                        .store
-                        .record_mood(user_id.to_string(), label, valence, note)
-                        .await
-                    {
-                        tracing::warn!("记录情绪失败：{error:#}");
-                    }
+                if let Some(mood) = parse_mood(item) {
+                    moods.push(mood);
                 }
             }
         }
 
-        Ok(saved)
+        Ok((saved, moods))
     }
 
     async fn run_tool_loop(
