@@ -160,7 +160,18 @@ pub struct Config {
     pub memory_min_score: f32,
     pub memory_history_messages: i64,
     pub memory_duplicate_threshold: f32,
-    pub memory_judge_skip_trivial: bool,
+    /// 自动记忆巩固：短期窗口滑出的旧消息批量交给记忆模型抽取/reconcile 成长期记忆。
+    /// 取代了旧的「每轮筛选用户单句」，改到压缩时对整批做，上下文更完整。
+    pub memory_consolidate_enabled: bool,
+    /// 触发一次巩固所需的「已滑出窗口、尚未巩固」的最少消息数。
+    pub memory_consolidate_batch: usize,
+    /// 尾巴 flush：定时扫描「空闲够久、且还有未巩固消息」的会话，强制把最后一段
+    /// （含仍在短期窗口内、平时不会 evict 的部分）也巩固掉，避免用户长期沉默时尾巴丢失。
+    pub memory_flush_enabled: bool,
+    /// 会话最后活动早于「现在 - 该秒数」才算空闲、可被 flush。
+    pub memory_flush_idle_seconds: u64,
+    /// flush 扫描周期（秒）。
+    pub memory_flush_interval_seconds: u64,
 
     /// 重排（rerank）：本地 ONNX 交叉编码器给 (query, 候选) 联合打分做二段精排。
     /// 关闭、模型加载失败或推理出错时，自动回退到一段余弦顺序，服务不受影响。
@@ -334,7 +345,15 @@ impl Config {
             memory_min_score: env_parse("MEMORY_MIN_SCORE", 0.30),
             memory_history_messages: clamp(env_parse("MEMORY_HISTORY_MESSAGES", 16), 0, 100),
             memory_duplicate_threshold: env_parse("MEMORY_DUPLICATE_THRESHOLD", 0.995),
-            memory_judge_skip_trivial: env_bool("MEMORY_JUDGE_SKIP_TRIVIAL", true),
+            memory_consolidate_enabled: env_bool("MEMORY_CONSOLIDATE_ENABLED", true),
+            memory_consolidate_batch: clamp(env_parse("MEMORY_CONSOLIDATE_BATCH", 6), 2, 100),
+            memory_flush_enabled: env_bool("MEMORY_FLUSH_ENABLED", true),
+            memory_flush_idle_seconds: clamp(env_parse("MEMORY_FLUSH_IDLE_SECONDS", 900), 60, 86400),
+            memory_flush_interval_seconds: clamp(
+                env_parse("MEMORY_FLUSH_INTERVAL_SECONDS", 300),
+                30,
+                3600,
+            ),
 
             rerank_enabled: env_bool("RERANK_ENABLED", true),
             rerank_model: env_string("RERANK_MODEL", "onnx-community/Qwen3-Reranker-0.6B-ONNX"),

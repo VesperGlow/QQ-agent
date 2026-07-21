@@ -103,6 +103,15 @@ async fn main() -> Result<()> {
             .await
     });
 
+    // 记忆尾巴 flush：定时把空闲会话里仍未巩固的尾巴也巩固掉（补 eviction 触发的盲区）。
+    {
+        let agent = agent.clone();
+        let shutdown = signal.subscribe();
+        tokio::spawn(async move {
+            agent.run_memory_flush_loop(shutdown).await;
+        });
+    }
+
     // QQ 桥接（与 API 同进程；任一意外退出即整体退出，交给容器 restart 拉起）
     let bridge = qq::QqBridge::new(cfg.clone(), agent, signal.subscribe(), pending.clone())?;
     tokio::select! {

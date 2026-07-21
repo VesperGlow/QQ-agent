@@ -128,6 +128,23 @@ fn migrate_embeddings_to_vec0(conn: &mut Connection, dim: usize) -> Result<()> {
     Ok(())
 }
 
+/// 旧库补列：`conversations.memory_upto_seq`（自动记忆巩固的水位线）。新库由 SCHEMA
+/// 直接带上，旧库 `CREATE TABLE IF NOT EXISTS` 不会补列，故在此 ALTER 补齐（幂等）。
+fn ensure_conversation_columns(conn: &Connection) -> Result<()> {
+    let has: bool = conn.query_row(
+        "SELECT count(*) FROM pragma_table_info('conversations') WHERE name = 'memory_upto_seq'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )? > 0;
+    if !has {
+        conn.execute(
+            "ALTER TABLE conversations ADD COLUMN memory_upto_seq INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY,
@@ -141,7 +158,8 @@ CREATE TABLE IF NOT EXISTS conversations (
   message_count INTEGER NOT NULL DEFAULT 0,
   summary TEXT NOT NULL DEFAULT '',
   summary_upto_seq INTEGER NOT NULL DEFAULT 0,
-  summary_at TEXT
+  summary_at TEXT,
+  memory_upto_seq INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS messages (
   id TEXT PRIMARY KEY,
@@ -254,6 +272,13 @@ pub struct PendingSummary {
     pub max_seq: i64,
 }
 
+/// 一批「已滑出短期窗口、尚未巩固进长期记忆」的旧消息（自动记忆巩固用）。
+#[derive(Debug, Clone)]
+pub struct PendingConsolidation {
+    pub messages: Vec<ChatTurn>,
+    pub max_seq: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct NewMemory {
     pub user_id: String,
@@ -302,6 +327,7 @@ impl Store {
             // 追加式存储：不再有开机清理过期记忆这一步。
             if index == 0 {
                 conn.execute_batch(SCHEMA)?;
+                ensure_conversation_columns(&conn)?;
                 ensure_vec_table(&conn, cfg.embedding_dimensions)?;
                 migrate_embeddings_to_vec0(&mut conn, cfg.embedding_dimensions)?;
             }
@@ -523,6 +549,93 @@ impl Store {
             conn.execute(
                 "UPDATE conversations SET summary = ?1, summary_upto_seq = ?2, summary_at = ?3 \n                 WHERE id = ?4 AND user_id = ?5",
                 params![summary, upto_seq, now_iso(), conversation_id, user_id],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// 取已滑出短期窗口（seq <= total-window）且尚未巩固（seq > memory_upto_seq）的旧消息，
+    /// 交给自动记忆巩固。与摘要各用独立水位线，互不影响（摘要可单独关闭）。
+    pub async fn messages_to_consolidate(
+        &self,
+        user_id: String,
+        conversation_id: String,
+        window: i64,
+        limit: i64,
+    ) -> Result<Option<PendingConsolidation>> {
+        self.run(move |conn, _| {
+            let convo: Option<(i64, i64)> = conn
+                .query_row(
+                    "SELECT memory_upto_seq, message_count FROM conversations \n                     WHERE id = ?1 AND user_id = ?2",
+                    params![conversation_id, user_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let Some((upto, total)) = convo else {
+                return Ok(None);
+            };
+            let mut stmt = conn.prepare(
+                "SELECT role, content, seq FROM messages \n                 WHERE conversation_id = ?1 AND seq > ?2 AND seq <= ?3 \n                 AND role IN ('user', 'assistant') ORDER BY seq ASC LIMIT ?4",
+            )?;
+            let rows: Vec<(String, String, i64)> = stmt
+                .query_map(
+                    params![
+                        conversation_id,
+                        upto,
+                        total - window.max(0),
+                        limit.clamp(1, 1000)
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )?
+                .collect::<std::result::Result<_, _>>()?;
+            if rows.is_empty() {
+                return Ok(None);
+            }
+            let max_seq = rows.last().map(|r| r.2).unwrap_or(0);
+            Ok(Some(PendingConsolidation {
+                messages: rows
+                    .into_iter()
+                    .map(|(role, content, _)| ChatTurn { role, content })
+                    .collect(),
+                max_seq,
+            }))
+        })
+        .await
+    }
+
+    /// 尾巴 flush 用：列出「最后活动早于 idle_before、且还有未巩固消息」的会话。
+    /// updated_at 由 now_iso 统一格式写入，字典序即时间序，可直接比较。
+    pub async fn conversations_idle_pending(
+        &self,
+        idle_before: String,
+        limit: i64,
+    ) -> Result<Vec<(String, String)>> {
+        self.run(move |conn, _| {
+            let mut stmt = conn.prepare(
+                "SELECT user_id, id FROM conversations \n                 WHERE updated_at < ?1 AND memory_upto_seq < message_count \n                 ORDER BY updated_at ASC LIMIT ?2",
+            )?;
+            let rows: Vec<(String, String)> = stmt
+                .query_map(params![idle_before, limit.clamp(1, 1000)], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })?
+                .collect::<std::result::Result<_, _>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// 推进自动记忆巩固的水位线（只增不减）。巩固成功后调用；失败则水位线不动、下轮重跑。
+    pub async fn advance_memory_watermark(
+        &self,
+        user_id: String,
+        conversation_id: String,
+        upto_seq: i64,
+    ) -> Result<()> {
+        self.run(move |conn, _| {
+            conn.execute(
+                "UPDATE conversations SET memory_upto_seq = ?1 \n                 WHERE id = ?2 AND user_id = ?3 AND ?1 > memory_upto_seq",
+                params![upto_seq, conversation_id, user_id],
             )?;
             Ok(())
         })
@@ -1495,6 +1608,74 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(has_col, 0);
+    }
+
+    #[tokio::test]
+    async fn consolidation_watermark_advances_and_drains() {
+        let (_dir, store) = open_store();
+        // 存 5 条消息（seq 1..=5）。窗口 = 2，故「已滑出窗口」= seq <= 5-2 = 3。
+        for i in 0..5 {
+            let role = if i % 2 == 0 { "user" } else { "assistant" };
+            store
+                .save_message("u1".into(), "c1".into(), role.into(), format!("消息{i}"))
+                .await
+                .unwrap();
+        }
+        let batch = store
+            .messages_to_consolidate("u1".into(), "c1".into(), 2, 200)
+            .await
+            .unwrap()
+            .expect("应有已滑出窗口的待巩固消息");
+        assert_eq!(batch.messages.len(), 3);
+        assert_eq!(batch.max_seq, 3);
+
+        // 推进水位线后，这批不再被取到（只剩仍在窗口内的 seq 4、5，未滑出）。
+        store
+            .advance_memory_watermark("u1".into(), "c1".into(), batch.max_seq)
+            .await
+            .unwrap();
+        assert!(store
+            .messages_to_consolidate("u1".into(), "c1".into(), 2, 200)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn idle_pending_lists_unconsolidated_convos() {
+        let (_dir, store) = open_store();
+        for i in 0..3 {
+            let role = if i % 2 == 0 { "user" } else { "assistant" };
+            store
+                .save_message("u1".into(), "c1".into(), role.into(), format!("m{i}"))
+                .await
+                .unwrap();
+        }
+        // 未来时刻做上界：更新时间必然早于它 → 该会话被视为空闲且有未巩固消息。
+        let future = "2999-01-01T00:00:00.000000+00:00".to_string();
+        assert_eq!(
+            store
+                .conversations_idle_pending(future.clone(), 100)
+                .await
+                .unwrap(),
+            vec![("u1".to_string(), "c1".to_string())]
+        );
+        // 过去时刻做上界：更新时间晚于它 → 不算空闲，取不到。
+        assert!(store
+            .conversations_idle_pending("2000-01-01T00:00:00.000000+00:00".into(), 100)
+            .await
+            .unwrap()
+            .is_empty());
+        // 全部巩固后（水位线 = message_count = 3），即便空闲也不再列出。
+        store
+            .advance_memory_watermark("u1".into(), "c1".into(), 3)
+            .await
+            .unwrap();
+        assert!(store
+            .conversations_idle_pending(future, 100)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
