@@ -59,6 +59,12 @@ pub const MEMORY_SEARCH_LIMIT: usize = 8;
 /// 实体保底召回一次最多补进候选池多少条（仅降级路径生效）。
 /// 补的是「按新近度早已沉底、但本轮字面提到了」的记忆，几十条足够，多了只是噪声。
 pub const MEMORY_ENTITY_RESCUE_MAX: usize = 30;
+/// 核心记忆（硬约束 + 助手承诺）每轮直接注入的条数上限。
+///
+/// 核心层不参与精选、永远在场，所以它是唯一会无节制侵占每轮上下文的东西。正常情况下
+/// 一个人的硬约束就那么几条，撑到这个数说明巩固器在滥用 constraint 标签——超了会打
+/// 一条 warn 提醒去 `mneme memory list` 看看，同时只保留最近写入的这么多条兜底。
+pub const MEMORY_CORE_MAX: usize = 60;
 pub const MEMORY_HISTORY_MESSAGES: i64 = 16;
 /// 近似去重阈值：字符三元组 Jaccard ≥ 此值即并入旧记忆。
 /// 0.9 ≈「只差标点或一两个语气词」；「喜欢 X」与「不喜欢 X」只有 0.3 左右，不会被误合并。
