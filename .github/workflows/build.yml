@@ -24,21 +24,7 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Unit tests (no model)
-        run: cargo test --no-default-features --locked
-
-      - name: Cache embedding model
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/huggingface
-          key: embedding-model-rust-${{ hashFiles('src/config.rs') }}
-          restore-keys: |
-            embedding-model-rust-
-            embedding-model-
-
-      - name: Full tests incl. real-model embedding smoke
-        env:
-          RUN_EMBEDDING_SMOKE: "1"
+      - name: Unit tests
         run: cargo test --locked
 
       - name: Release build (mirrors the docker build step)

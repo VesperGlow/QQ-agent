@@ -31,31 +31,60 @@ pub fn to_data_uri(bytes: &[u8]) -> String {
     format!("data:{};base64,{}", sniff_mime(bytes), BASE64.encode(bytes))
 }
 
+/// 解码期允许的分配上限相对「像素数 × 每像素字节」的倍数。
+///
+/// 最坏路径是带透明通道的图：`DynamicImage` 本身 4 字节/像素，`flatten_to_rgb` 里
+/// `to_rgba8()` 再复制一份 4 字节/像素，输出的 `RgbImage` 3 字节/像素——同时在世约
+/// 11 字节/像素。取 12 留一点余量。（缩放的输出受 `max_edge` 约束，不参与这个峰值。）
+const DECODE_BYTES_PER_PIXEL: u64 = 12;
+
 /// 把图片整理到可发送状态：体积在 `max_bytes` 内且长边不超过 `max_edge` 的原样返回；
 /// 否则解码（jpeg/png）、透明底合成白色、缩放，再按质量/尺寸递降重编码 JPEG，
 /// 直到压进限制。解码是 CPU 密集操作，异步上下文里请放 spawn_blocking 调用。
-pub fn prepare(bytes: Vec<u8>, max_bytes: usize, max_edge: u32) -> Result<Vec<u8>> {
+///
+/// `max_pixels` 是**解码前**的像素数闸门。`max_edge` 管的是输出尺寸，而缩放发生在解码
+/// 之后——不设这道闸，一张 8000×6000 的原图会先老老实实解成几百 MB 的缓冲，容器的
+/// 内存上限只能以 OOM 收场。宁可给一条能看懂的错误。
+pub fn prepare(bytes: Vec<u8>, max_bytes: usize, max_edge: u32, max_pixels: u32) -> Result<Vec<u8>> {
+    // 只解析一次文件头拿尺寸（原先为了同一个信息建了两次 reader）。
+    let dimensions = image::ImageReader::new(Cursor::new(&bytes))
+        .with_guessed_format()
+        .ok()
+        .and_then(|reader| reader.into_dimensions().ok());
+
     let needs_work = bytes.len() > max_bytes
-        || match image::ImageReader::new(Cursor::new(&bytes))
-            .with_guessed_format()
-            .ok()
-            .and_then(|reader| reader.into_dimensions().ok())
-        {
-            Some((width, height)) => width.max(height) > max_edge,
-            // 读不出尺寸（不支持的格式等）：体积达标就原样放行
-            None => false,
-        };
+        // 读不出尺寸（不支持的格式等）：体积达标就原样放行
+        || dimensions.map_or(false, |(width, height)| width.max(height) > max_edge);
     if !needs_work {
         return Ok(bytes);
     }
 
-    let decoded = image::ImageReader::new(Cursor::new(&bytes))
+    if let Some((width, height)) = dimensions {
+        let pixels = u64::from(width) * u64::from(height);
+        if pixels > u64::from(max_pixels) {
+            bail!(
+                "图片 {width}×{height} 共 {:.1} 百万像素，超过上限 {:.1} 百万（CHAT_IMAGE_MAX_PIXELS）；\
+                 解码需要约 {} MB 内存，已拒绝",
+                pixels as f64 / 1e6,
+                f64::from(max_pixels) / 1e6,
+                pixels * DECODE_BYTES_PER_PIXEL / 1_048_576,
+            );
+        }
+    }
+
+    let mut reader = image::ImageReader::new(Cursor::new(&bytes))
         .with_guessed_format()
-        .context("识别图片格式失败")?
-        .decode();
-    let decoded = match decoded {
+        .context("识别图片格式失败")?;
+    // 上面的像素闸门依赖文件头里的尺寸；读不出尺寸、或头部尺寸与实际数据不符的格式
+    // 就绕过了它。这里再让解码器自己守住分配上限——image 的默认值是 512 MiB，
+    // 对一个几百 MB 上限的容器等于没有。
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(u64::from(max_pixels) * DECODE_BYTES_PER_PIXEL);
+    reader.limits(limits);
+
+    let decoded = match reader.decode() {
         Ok(img) => img,
-        // 解码不了（gif/webp 未启用、文件损坏等）：小图原样放行，大图只能拒绝
+        // 解码不了（gif/webp 未启用、文件损坏、超出 limits 等）：小图原样放行，大图只能拒绝
         Err(error) => {
             if bytes.len() <= max_bytes {
                 return Ok(bytes);
@@ -120,7 +149,12 @@ fn flatten_to_rgb(img: DynamicImage) -> RgbImage {
 /// 归一化 API 请求里的一项图片：
 /// - `http(s)://…` 原样透传（由上游 AI 提供商拉取，无法本地压缩）；
 /// - `data:…;base64,…` 或裸 base64：解码校验、按需压缩，再按嗅探出的 MIME 重建 data URI。
-pub fn normalize_input(raw: &str, max_bytes: usize, max_edge: u32) -> Result<String> {
+pub fn normalize_input(
+    raw: &str,
+    max_bytes: usize,
+    max_edge: u32,
+    max_pixels: u32,
+) -> Result<String> {
     let value = raw.trim();
     if value.is_empty() {
         bail!("images 里包含空项");
@@ -146,7 +180,7 @@ pub fn normalize_input(raw: &str, max_bytes: usize, max_edge: u32) -> Result<Str
     if bytes.is_empty() {
         bail!("图片内容为空");
     }
-    let prepared = prepare(bytes, max_bytes, max_edge)?;
+    let prepared = prepare(bytes, max_bytes, max_edge, max_pixels)?;
     Ok(to_data_uri(&prepared))
 }
 
@@ -184,14 +218,14 @@ mod tests {
     #[test]
     fn prepare_passes_small_images_untouched() {
         let png = test_png(64, 64);
-        let out = prepare(png.clone(), 5_000_000, 2048).unwrap();
+        let out = prepare(png.clone(), 5_000_000, 2048, 16_000_000).unwrap();
         assert_eq!(out, png);
     }
 
     #[test]
     fn prepare_downscales_oversized_edge() {
         let png = test_png(800, 400);
-        let out = prepare(png, 5_000_000, 256).unwrap();
+        let out = prepare(png, 5_000_000, 256, 16_000_000).unwrap();
         assert!(out.starts_with(b"\xFF\xD8\xFF")); // 重编码成 JPEG
         let (width, height) = image::ImageReader::new(Cursor::new(&out))
             .with_guessed_format()
@@ -208,7 +242,7 @@ mod tests {
         let png = test_png(1000, 750);
         let limit = 60_000;
         assert!(png.len() > limit, "测试图应大于限制");
-        let out = prepare(png, limit, 4096).unwrap();
+        let out = prepare(png, limit, 4096, 16_000_000).unwrap();
         assert!(out.len() <= limit, "压缩后 {} 字节仍超限", out.len());
         assert!(out.starts_with(b"\xFF\xD8\xFF"));
     }
@@ -217,22 +251,40 @@ mod tests {
     fn prepare_rejects_oversized_garbage() {
         let garbage = vec![0xABu8; 1024];
         // 体积达标：原样放行
-        assert_eq!(prepare(garbage.clone(), 4096, 2048).unwrap(), garbage);
+        assert_eq!(prepare(garbage.clone(), 4096, 2048, 16_000_000).unwrap(), garbage);
         // 超限且无法解码：拒绝
-        assert!(prepare(garbage, 512, 2048).is_err());
+        assert!(prepare(garbage, 512, 2048, 16_000_000).is_err());
+    }
+
+    #[test]
+    fn prepare_rejects_images_over_pixel_budget() {
+        // 800×400 = 320k 像素；闸门设 100k，且长边超过 max_edge 触发处理路径。
+        let png = test_png(800, 400);
+        let error = prepare(png, 5_000_000, 256, 100_000).unwrap_err().to_string();
+        assert!(error.contains("800×400"), "错误信息应带上尺寸：{error}");
+        assert!(error.contains("CHAT_IMAGE_MAX_PIXELS"), "应指明是哪个配置项：{error}");
+    }
+
+    #[test]
+    fn pixel_budget_does_not_reject_images_that_need_no_work() {
+        // 体积与长边都达标 → 走原样放行的早退分支，根本不解码，
+        // 所以哪怕像素闸门设得比图还小也不该拒。顺序不能反。
+        let png = test_png(800, 400);
+        let out = prepare(png.clone(), 5_000_000, 2048, 1_000).unwrap();
+        assert_eq!(out, png);
     }
 
     #[test]
     fn normalize_passes_urls_and_rebuilds_base64() {
         assert_eq!(
-            normalize_input("https://example.com/a.jpg", 1024, 2048).unwrap(),
+            normalize_input("https://example.com/a.jpg", 1024, 2048, 16_000_000).unwrap(),
             "https://example.com/a.jpg"
         );
         let encoded = BASE64.encode(PNG_HEAD);
-        let uri = normalize_input(&encoded, 1024, 2048).unwrap();
+        let uri = normalize_input(&encoded, 1024, 2048, 16_000_000).unwrap();
         assert!(uri.starts_with("data:image/png;base64,"));
         // data URI 输入按嗅探结果重建 MIME（声明的 image/jpeg 被纠正为 png）。
-        let uri = normalize_input(&format!("data:image/jpeg;base64,{encoded}"), 1024, 2048).unwrap();
+        let uri = normalize_input(&format!("data:image/jpeg;base64,{encoded}"), 1024, 2048, 16_000_000).unwrap();
         assert!(uri.starts_with("data:image/png;base64,"));
     }
 
@@ -240,7 +292,7 @@ mod tests {
     fn normalize_compresses_oversized_base64() {
         let png = test_png(1000, 750);
         let limit = 60_000;
-        let uri = normalize_input(&BASE64.encode(&png), limit, 4096).unwrap();
+        let uri = normalize_input(&BASE64.encode(&png), limit, 4096, 16_000_000).unwrap();
         assert!(uri.starts_with("data:image/jpeg;base64,"));
         // data URI 开销约 4/3，宽松校验落在限制附近
         assert!(uri.len() <= limit * 4 / 3 + 64);
@@ -248,8 +300,8 @@ mod tests {
 
     #[test]
     fn normalize_rejects_bad_input() {
-        assert!(normalize_input("", 1024, 2048).is_err());
-        assert!(normalize_input("不是base64!!!", 1024, 2048).is_err());
-        assert!(normalize_input("data:image/png,notbase64", 1024, 2048).is_err()); // 非 base64 data URI
+        assert!(normalize_input("", 1024, 2048, 16_000_000).is_err());
+        assert!(normalize_input("不是base64!!!", 1024, 2048, 16_000_000).is_err());
+        assert!(normalize_input("data:image/png,notbase64", 1024, 2048, 16_000_000).is_err()); // 非 base64 data URI
     }
 }

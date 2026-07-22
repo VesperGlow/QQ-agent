@@ -456,9 +456,10 @@ impl QqBridge {
         let original = bytes.len();
         let max_bytes = self.cfg.chat_image_max_bytes;
         let max_edge = self.cfg.chat_image_max_edge;
+        let max_pixels = self.cfg.chat_image_max_pixels;
         // 解码/缩放/重编码是 CPU 密集操作，放阻塞线程池执行，不堵 async worker。
         let prepared = tokio::task::spawn_blocking(move || {
-            crate::image::prepare(bytes.to_vec(), max_bytes, max_edge)
+            crate::image::prepare(bytes.to_vec(), max_bytes, max_edge, max_pixels)
         })
         .await
         .context("图片压缩任务被取消")??;

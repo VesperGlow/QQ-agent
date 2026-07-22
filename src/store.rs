@@ -1,11 +1,11 @@
-//! SQLite 存储：关系数据（对话/记忆/实体/情绪）在普通表，向量存进 sqlite-vec 的 vec0
-//! 虚拟表做余弦 KNN；rowid 对应 memories 行。旧库首次启动会把 f16 BLOB 向量迁进 vec0。
+//! SQLite 存储：对话/记忆/实体/情绪全在普通关系表里，没有向量、没有虚拟表。
 //! 追加式（append-only）：记忆只新增，不因时间过期；软删除/取代仍保留可审计留痕。
-//! 检索一段 = vec0 KNN 召回候选，二段精排（rerank）在 agent 层完成。
+//! 检索不在这一层做语义判断——本模块只负责按新近度端出候选池（[`Store::memory_pool`]）
+//! 和按 id 取回正文（[`Store::memories_by_ids`]），选哪几条由 agent 层交给记忆模型决定。
 
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{Duration, SecondsFormat, Utc};
@@ -41,94 +41,35 @@ pub fn clean_relation(value: &str) -> String {
     }
 }
 
-// f16 编码只剩迁移的单测在用（校验 blob_to_vec 依赖的 f16 布局）；保留但允许未使用。
-#[allow(dead_code)]
-pub fn vec_to_blob(vector: &[f32]) -> Vec<u8> {
-    let mut blob = Vec::with_capacity(vector.len() * 2);
-    for value in vector {
-        blob.extend_from_slice(&half::f16::from_f32(*value).to_le_bytes());
+/// 把文本切成字符三元组（中文按字、英文按字符，不需要分词器）。
+/// 先滤掉空白与标点：近似去重要抓的正是「只差一个句号/逗号」这类改写，标点参与比较
+/// 反而会把它们判成不同。短于 3 个字符的文本退化成它自己，保证永远至少产出一个 gram。
+fn trigrams(text: &str) -> std::collections::HashSet<String> {
+    let chars: Vec<char> = text
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect();
+    if chars.len() < 3 {
+        return std::iter::once(chars.into_iter().collect()).collect();
     }
-    blob
+    chars.windows(3).map(|w| w.iter().collect()).collect()
 }
 
-pub fn blob_to_vec(blob: &[u8]) -> Vec<f32> {
-    blob.chunks_exact(2)
-        .map(|pair| half::f16::from_le_bytes([pair[0], pair[1]]).to_f32())
-        .collect()
-}
-
-/// vec0 需要原始 float32 小端字节；检索与入库都用它把 `Vec<f32>` 变成可绑定的 BLOB。
-fn vec_to_blob_f32(vector: &[f32]) -> Vec<u8> {
-    let mut blob = Vec::with_capacity(vector.len() * 4);
-    for value in vector {
-        blob.extend_from_slice(&value.to_le_bytes());
+/// 字符三元组 Jaccard 相似度（0..=1）。用于「近乎完全相同的表述」的合并判定——
+/// 取代了原先基于向量余弦的近似去重。注意它衡量的是**字面**重合而非语义：这正是
+/// 这里想要的，真正的语义判重由记忆模型在巩固时 reconcile 完成。
+pub fn trigram_similarity(a: &str, b: &str) -> f32 {
+    let (ga, gb) = (trigrams(a), trigrams(b));
+    let intersection = ga.intersection(&gb).count();
+    let union = ga.len() + gb.len() - intersection;
+    if union == 0 {
+        return 0.0;
     }
-    blob
+    intersection as f32 / union as f32
 }
 
-/// 进程内注册 sqlite-vec（vec0 虚拟表）。auto_extension 只对注册之后新开的连接生效，
-/// 故须在任何 `Connection::open` 之前调用；`Once` 保证只注册一次。
-fn register_vec_extension() {
-    static VEC_INIT: Once = Once::new();
-    VEC_INIT.call_once(|| unsafe {
-        rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
-            sqlite_vec::sqlite3_vec_init as *const (),
-        )));
-    });
-}
-
-/// 建 vec0 向量表（幂等）。`embedding` 是向量列，`user_id`/`subject`/`kind` 是可在 KNN
-/// 里过滤的元数据列；rowid 对应 `memories` 的隐式 rowid，距离用余弦（1 − 余弦相似度）。
-fn ensure_vec_table(conn: &Connection, dim: usize) -> Result<()> {
-    conn.execute_batch(&format!(
-        "CREATE VIRTUAL TABLE IF NOT EXISTS vec_memories USING vec0(\n           embedding float[{dim}] distance_metric=cosine,\n           user_id text,\n           subject text,\n           kind text\n         );"
-    ))?;
-    Ok(())
-}
-
-/// 旧库迁移：把 `memories.embedding`（f16 BLOB）里活跃记忆的向量回填进 vec0，成功后移除
-/// `embedding` 列（向量从此只存 vec0 一份）。幂等：每次先清空 vec0 再回填；无该列则跳过。
-fn migrate_embeddings_to_vec0(conn: &mut Connection, dim: usize) -> Result<()> {
-    let has_col: bool = conn.query_row(
-        "SELECT count(*) FROM pragma_table_info('memories') WHERE name = 'embedding'",
-        [],
-        |row| row.get::<_, i64>(0),
-    )? > 0;
-    if !has_col {
-        return Ok(());
-    }
-    let tx = conn.transaction()?;
-    tx.execute("DELETE FROM vec_memories", [])?;
-    let mut stmt = tx.prepare(
-        "SELECT rowid, embedding, user_id, subject, kind FROM memories WHERE active = 1",
-    )?;
-    let rows: Vec<(i64, Vec<u8>, String, String, String)> = stmt
-        .query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
-        })?
-        .collect::<std::result::Result<_, _>>()?;
-    drop(stmt);
-    let mut migrated = 0usize;
-    for (rowid, blob, user_id, subject, kind) in rows {
-        let vector = blob_to_vec(&blob);
-        if vector.len() != dim {
-            tracing::warn!("跳过维度不符的旧向量 rowid={rowid}（{} != {dim}）", vector.len());
-            continue;
-        }
-        tx.execute(
-            "INSERT INTO vec_memories(rowid, embedding, user_id, subject, kind) \n             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![rowid, vec_to_blob_f32(&vector), user_id, subject, kind],
-        )?;
-        migrated += 1;
-    }
-    tx.commit()?;
-    // 回填提交成功后再删列（不可逆）；中途失败则下次启动重跑（先清空再回填，幂等）。
-    conn.execute("ALTER TABLE memories DROP COLUMN embedding", [])?;
-    tracing::info!("向量已迁移到 vec0：{migrated} 条，memories.embedding 列已移除");
-    Ok(())
-}
-
-/// 旧库退场：移除 `memories.level`。分级早已废弃（排序纯靠二段 rerank，落库恒为同一等级），
+/// 旧库退场：移除 `memories.level`。分级早已废弃（落库恒为同一等级），
 /// 该列没有任何读者。停止维护并 DROP（幂等：无该列则跳过）。不可逆，但列本就无信息量。
 fn migrate_drop_level_column(conn: &Connection) -> Result<()> {
     let has_col: bool = conn.query_row(
@@ -139,6 +80,31 @@ fn migrate_drop_level_column(conn: &Connection) -> Result<()> {
     if has_col {
         conn.execute("ALTER TABLE memories DROP COLUMN level", [])?;
         tracing::info!("memories.level 列已移除（分级维度已废弃）");
+    }
+    Ok(())
+}
+
+/// 旧库退场：清掉向量存储的残留。检索改由记忆模型精选后，`vec_memories` 虚拟表与更早的
+/// `memories.embedding` 列都没有读者了。
+///
+/// 两步都是尽力而为、失败不致命：本进程不再注册 sqlite-vec，`DROP TABLE vec_memories`
+/// 会因「no such module: vec0」而失败——留着也只是一张再没有语句引用的死表，不影响任何
+/// 读写。真想彻底清干净，用带 vec0 扩展的 sqlite3 手动 DROP 一次即可。
+fn migrate_drop_vector_storage(conn: &Connection) -> Result<()> {
+    match conn.execute("DROP TABLE IF EXISTS vec_memories", []) {
+        Ok(_) => tracing::info!("vec_memories 虚拟表已移除（检索不再使用向量）"),
+        Err(error) => {
+            tracing::debug!("跳过 vec_memories 清理（缺 vec0 模块，无影响）：{error}")
+        }
+    }
+    let has_col: bool = conn.query_row(
+        "SELECT count(*) FROM pragma_table_info('memories') WHERE name = 'embedding'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )? > 0;
+    if has_col {
+        conn.execute("ALTER TABLE memories DROP COLUMN embedding", [])?;
+        tracing::info!("memories.embedding 列已移除（检索不再使用向量）");
     }
     Ok(())
 }
@@ -274,6 +240,16 @@ pub struct MemoryView {
     pub superseded_memory_id: Option<String>,
 }
 
+/// 候选池里的一条记忆：精选阶段只需要这几个字段（实体、时间戳等对挑选没有帮助，
+/// 却会成倍放大喂给模型的 token）。
+#[derive(Debug, Clone)]
+pub struct MemoryCandidate {
+    pub id: String,
+    pub text: String,
+    pub kind: String,
+    pub subject: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatTurn {
     pub role: String,
@@ -295,13 +271,12 @@ pub struct NewMemory {
     pub kind: String,
     pub subject: String,
     pub entities: Vec<EntityView>,
-    pub embedding: Vec<f32>,
     pub source: String,
 }
 
 #[derive(Clone)]
 pub struct Store {
-    // 一把全局 Mutex 会让检索（O(n) 暴力扫描）与后台落库互相排队；改用小连接池，
+    // 一把全局 Mutex 会让候选池扫描与后台落库互相排队；改用小连接池，
     // 靠 WAL 的多读单写 + busy_timeout 让并发操作尽量并行。
     pool: Arc<Vec<Mutex<Connection>>>,
     next: Arc<AtomicUsize>,
@@ -314,11 +289,9 @@ impl Store {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        // vec0 扩展须在开连接前注册（对之后新开的每条连接生效）。
-        register_vec_extension();
         let mut pool = Vec::with_capacity(DB_POOL_SIZE);
         for index in 0..DB_POOL_SIZE {
-            let mut conn = Connection::open(path).with_context(|| {
+            let conn = Connection::open(path).with_context(|| {
                 format!(
                     "无法打开数据库 {}。若挂载的数据目录属主不是本容器用户，请修正属主 \n                     （如 podman unshare chown）或重建卷。",
                     cfg.db_path
@@ -331,14 +304,13 @@ impl Store {
             conn.pragma_update(None, "busy_timeout", 5000)?;
             // 页缓存默认约 2MB；个人库读写量小，每连接 512KB 足够（负值单位为 KiB）。
             conn.pragma_update(None, "cache_size", -512)?;
-            // schema 建表 + vec0 表 + 旧库向量迁移只需在一条连接上做一次（均幂等）。
+            // schema 建表与旧库迁移只需在一条连接上做一次（均幂等）。
             // 追加式存储：不再有开机清理过期记忆这一步。
             if index == 0 {
                 conn.execute_batch(SCHEMA)?;
                 ensure_conversation_columns(&conn)?;
                 migrate_drop_level_column(&conn)?;
-                ensure_vec_table(&conn, cfg.embedding_dimensions)?;
-                migrate_embeddings_to_vec0(&mut conn, cfg.embedding_dimensions)?;
+                migrate_drop_vector_storage(&conn)?;
             }
             pool.push(Mutex::new(conn));
         }
@@ -609,54 +581,77 @@ impl Store {
 
     // ---------- 长期记忆 ----------
 
-    /// 一段召回：对该用户全部活跃记忆做暴力余弦，按相似度取 top-`limit` 候选。
-    /// 不再叠加新近度/等级/关键词加权——最终排序质量交给 agent 层的二段重排（rerank）。
-    /// `limit` 是候选宽度：启用重排时通常传 `rerank_candidates`，未启用时传最终条数。
-    pub async fn search_memories(
+    /// 候选池：该用户的活跃记忆，按最近提及倒序取最多 `limit` 条，只带精选所需的
+    /// 最小字段（id/text/kind/subject），不查实体也不组装 [`MemoryView`]。
+    ///
+    /// 这是「LLM 精选」检索的第一步：整池原样喂给记忆模型让它挑，所以这里刻意**不做**
+    /// 任何相关性判断。超出 `limit` 时按 `last_seen_at` 截断——留下最近被提及的那部分，
+    /// 是无语义信息可用时最合理的取舍。
+    pub async fn memory_pool(
         &self,
         user_id: String,
-        embedding: Vec<f32>,
-        limit: Option<usize>,
-        min_score: Option<f32>,
-    ) -> Result<Vec<MemoryView>> {
-        self.run(move |conn, cfg| {
-            let limit = limit.unwrap_or(cfg.memory_search_limit);
-            let min_score = min_score.unwrap_or(cfg.memory_min_score);
-            let query = vec_to_blob_f32(&embedding);
-
-            // 一段召回 = vec0 KNN：按 user_id 过滤的余弦最近邻（vec0 只存活跃记忆）。
-            // distance = 1 − 余弦相似度；相似度低于 min_score 的丢弃，最终排序交给二段 rerank。
-            let mut stmt = conn.prepare(&format!(
-                "SELECT {MEMORY_COLUMNS}, knn.distance FROM ( \n                   SELECT rowid, distance FROM vec_memories \n                   WHERE embedding MATCH ?1 AND user_id = ?2 AND k = ?3 \n                 ) knn \n                 JOIN memories m ON m.rowid = knn.rowid \n                 WHERE m.active = 1 \n                 ORDER BY knn.distance"
-            ))?;
-            let scored: Vec<(MemoryRow, f32)> = stmt
-                .query_map(params![query, user_id, limit as i64], |row| {
-                    let similarity = (1.0 - row.get::<_, f64>(5)?) as f32;
-                    Ok((MemoryRow::from_row(row)?, similarity))
+        limit: usize,
+    ) -> Result<Vec<MemoryCandidate>> {
+        self.run(move |conn, _| {
+            let mut stmt = conn.prepare(
+                // rowid 做次级排序键：同一微秒内写入的两条记忆 last_seen_at 可能相等，
+                // 光按时间排序结果不确定，截断时会随机丢掉其中一条。
+                "SELECT id, text, kind, subject FROM memories \n                 WHERE user_id = ?1 AND active = 1 \n                 ORDER BY last_seen_at DESC, rowid DESC LIMIT ?2",
+            )?;
+            let rows: Vec<MemoryCandidate> = stmt
+                .query_map(params![user_id, limit as i64], |row| {
+                    Ok(MemoryCandidate {
+                        id: row.get(0)?,
+                        text: row.get(1)?,
+                        kind: row.get(2)?,
+                        subject: row.get(3)?,
+                    })
                 })?
-                .collect::<std::result::Result<Vec<_>, _>>()?
-                .into_iter()
-                .filter(|(_, similarity)| *similarity >= min_score)
-                .collect();
+                .collect::<std::result::Result<_, _>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// 按 id 批量取回完整记忆（含实体），用于把精选结果还原成 [`MemoryView`]。
+    /// 返回顺序与 `ids` 一致（模型给出的顺序即相关性顺序，要保住）；查不到的 id 静默跳过。
+    pub async fn memories_by_ids(
+        &self,
+        user_id: String,
+        ids: Vec<String>,
+    ) -> Result<Vec<MemoryView>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.run(move |conn, _| {
+            let placeholders = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {MEMORY_COLUMNS} FROM memories \n                 WHERE active = 1 AND user_id = ?1 AND id IN ({placeholders})"
+            ))?;
+            // 绑定参数：?1 是 user_id，其后依次是各个 id。
+            let params = std::iter::once(&user_id).chain(ids.iter());
+            let rows: Vec<MemoryRow> = stmt
+                .query_map(rusqlite::params_from_iter(params), MemoryRow::from_row)?
+                .collect::<std::result::Result<_, _>>()?;
             drop(stmt);
 
-            // 检索为纯读路径：不再回写 access_count/last_accessed_at（这两列无任何读者，
-            // 每次检索都写最多 rerank_candidates 行纯属写放大，还和真正的写入抢 WAL 单写锁）。
+            // 检索为纯读路径：不回写 access_count/last_accessed_at（两列无任何读者，
+            // 每次检索都写一批纯属写放大，还和真正的写入抢 WAL 单写锁）。
             // 一次性取回所有命中记忆的实体，避免逐条查询（N+1）。
-            let ids: Vec<&str> = scored.iter().map(|(row, _)| row.id.as_str()).collect();
-            let mut entities = fetch_entities_map(conn, &ids)?;
-            let views = scored
-                .into_iter()
-                .map(|(rowdata, similarity)| {
-                    let mut view = memory_view_with_entities(
-                        &rowdata,
-                        entities.remove(&rowdata.id).unwrap_or_default(),
+            let id_refs: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+            let mut entities = fetch_entities_map(conn, &id_refs)?;
+            let mut by_id: std::collections::HashMap<String, MemoryView> = rows
+                .iter()
+                .map(|row| {
+                    let view = memory_view_with_entities(
+                        row,
+                        entities.remove(&row.id).unwrap_or_default(),
                     );
-                    view.score = Some((similarity * 1e6).round() / 1e6);
-                    view
+                    (row.id.clone(), view)
                 })
                 .collect();
-            Ok(views)
+            // IN (...) 的返回顺序由 SQLite 决定，这里按调用方给的 id 顺序重排。
+            Ok(ids.iter().filter_map(|id| by_id.remove(id)).collect())
         })
         .await
     }
@@ -691,19 +686,12 @@ impl Store {
 
     pub async fn forget_memory(&self, user_id: String, memory_id: String) -> Result<bool> {
         self.run(move |conn, _| {
-            let tx = conn.transaction()?;
-            let changed = tx.execute(
+            // 软删：memories 行保留（可审计、可沿取代链回溯），只把 active 置 0。
+            // 候选池与按 id 取回都过滤 active = 1，停用后自然不再被检索到。
+            let changed = conn.execute(
                 "UPDATE memories SET active = 0, forgotten_at = ?1 \n                 WHERE id = ?2 AND user_id = ?3 AND active = 1",
                 params![now_iso(), memory_id, user_id],
             )?;
-            if changed > 0 {
-                // 软删的记忆从向量索引移除（memories 行仍在，rowid 可查）。
-                tx.execute(
-                    "DELETE FROM vec_memories WHERE rowid = \n                     (SELECT rowid FROM memories WHERE id = ?1)",
-                    params![memory_id],
-                )?;
-            }
-            tx.commit()?;
             Ok(changed > 0)
         })
         .await
@@ -724,19 +712,11 @@ impl Store {
                 if created_id == old_id_for_update {
                     return Ok(false);
                 }
-                let tx = conn.transaction()?;
-                let changed = tx.execute(
+                // 停用旧记忆并记下取代关系；memories 行保留，可沿链回溯完整演变史。
+                let changed = conn.execute(
                     "UPDATE memories SET active = 0, superseded_by = ?1, superseded_at = ?2 \n                     WHERE id = ?3 AND user_id = ?4",
                     params![created_id, now_iso(), old_id_for_update, user_id],
                 )?;
-                if changed > 0 {
-                    // 被取代的旧记忆从向量索引移除（memories 行保留可回溯）。
-                    tx.execute(
-                        "DELETE FROM vec_memories WHERE rowid = \n                         (SELECT rowid FROM memories WHERE id = ?1)",
-                        params![old_id_for_update],
-                    )?;
-                }
-                tx.commit()?;
                 Ok(changed > 0)
             })
             .await?;
@@ -1090,24 +1070,39 @@ fn create_memory_sync(conn: &mut Connection, cfg: &Config, new: NewMemory) -> Re
         return touch_memory(conn, &id, &now);
     }
 
-    // 近乎完全相同的表述用极高阈值合并（默认 0.995）：在 vec0 里查同 user/subject 的最近
-    // 一条，余弦 ≥ 阈值即视为重复、并入旧记忆。作用域与上面的指纹去重一致（都按 user+subject）；
-    // 不再按 kind 过滤，好让「同一件事被两次巩固标成不同 kind」的近似重复也能合并。极高阈值
-    // 本身足以区分“喜欢 X”和“不喜欢 X”，不需要 kind 兜底。
-    let near: Option<(i64, f64)> = conn
-        .query_row(
-            "SELECT rowid, distance FROM vec_memories \n             WHERE embedding MATCH ?1 AND user_id = ?2 AND subject = ?3 AND k = 1",
-            params![vec_to_blob_f32(&new.embedding), new.user_id, subject],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
-    if let Some((rowid, distance)) = near {
-        if 1.0 - distance >= cfg.memory_duplicate_threshold as f64 {
-            let id: String = conn.query_row(
-                "SELECT id FROM memories WHERE rowid = ?1",
-                params![rowid],
-                |row| row.get(0),
-            )?;
+    // 近乎完全相同的表述用高阈值合并（字符三元组 Jaccard，默认 0.9）：扫同 user/subject
+    // 的活跃记忆，最相似的一条若 ≥ 阈值即视为重复、并入旧记忆。作用域与上面的指纹去重一致
+    // （都按 user+subject）；不按 kind 过滤，好让「同一件事被两次巩固标成不同 kind」的近似
+    // 重复也能合并。
+    //
+    // 这一步只兜「改了个标点/语气词」这类字面近重；语义层面的重复（换种说法讲同一件事）
+    // 由记忆模型在巩固时对照已有记忆 reconcile 成 update，不指望这里。
+    //
+    // 长度比在 [0.5, 2] 之外的直接跳过：字数差一倍以上不可能达到 0.9 的 Jaccard，
+    // 先用一次整数比较挡掉大部分候选，省去建三元组集合的开销。
+    let new_chars = text.chars().count();
+    let mut stmt = conn.prepare(
+        "SELECT id, text FROM memories \n         WHERE user_id = ?1 AND subject = ?2 AND active = 1",
+    )?;
+    let candidates: Vec<(String, String)> = stmt
+        .query_map(params![new.user_id, subject], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
+        .collect::<std::result::Result<_, _>>()?;
+    drop(stmt);
+    let mut best: Option<(String, f32)> = None;
+    for (id, existing_text) in candidates {
+        let existing_chars = existing_text.chars().count();
+        if existing_chars * 2 < new_chars || new_chars * 2 < existing_chars {
+            continue;
+        }
+        let similarity = trigram_similarity(&text, &existing_text);
+        if best.as_ref().map_or(true, |(_, top)| similarity > *top) {
+            best = Some((id, similarity));
+        }
+    }
+    if let Some((id, similarity)) = best {
+        if similarity >= cfg.memory_duplicate_threshold {
             return touch_memory(conn, &id, &now);
         }
     }
@@ -1143,17 +1138,6 @@ fn create_memory_sync(conn: &mut Connection, cfg: &Config, new: NewMemory) -> Re
             fingerprint,
             new.source,
             now,
-        ],
-    )?;
-    // 向量只存 vec0 一份；rowid 对应刚插入的 memories 行。
-    tx.execute(
-        "INSERT INTO vec_memories(rowid, embedding, user_id, subject, kind) \n         VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![
-            tx.last_insert_rowid(),
-            vec_to_blob_f32(&new.embedding),
-            new.user_id,
-            subject,
-            new.kind,
         ],
     )?;
     for (name, entity_type, key) in &safe_entities {
@@ -1255,16 +1239,14 @@ fn resolve_memory_id(conn: &Connection, input: &str, active_only: bool) -> Resul
     }
 }
 
-/// CLI `memory delete <id>`：硬删除一条记忆（彻底 `DELETE` + FK 级联清实体链接 +
-/// 移出 vec0），返回被删文本；找不到返回 None。memories 与 vec0 放同一事务；不可逆。
+/// CLI `memory delete <id>`：硬删除一条记忆（彻底 `DELETE` + FK 级联清实体链接），
+/// 返回被删文本；找不到返回 None。不可逆。
 pub fn cli_delete_memory(cfg: &Config, id: &str) -> Result<Option<String>> {
-    register_vec_extension();
-    let mut conn = Connection::open(&cfg.db_path)
+    let conn = Connection::open(&cfg.db_path)
         .with_context(|| format!("无法打开数据库 {}", cfg.db_path))?;
     conn.pragma_update(None, "busy_timeout", 5000)?;
     // 级联清掉 memory_entities/memory_links。
     conn.pragma_update(None, "foreign_keys", true)?;
-    ensure_vec_table(&conn, cfg.embedding_dimensions)?;
 
     let full_id = match resolve_memory_id(&conn, id, false)? {
         Some(full) => full,
@@ -1275,15 +1257,7 @@ pub fn cli_delete_memory(cfg: &Config, id: &str) -> Result<Option<String>> {
         params![full_id],
         |row| row.get(0),
     )?;
-
-    // 先删向量索引（趁 memories 行还在、rowid 可查；删后 rowid 会被复用），同一事务。
-    let tx = conn.transaction()?;
-    tx.execute(
-        "DELETE FROM vec_memories WHERE rowid = (SELECT rowid FROM memories WHERE id = ?1)",
-        params![full_id],
-    )?;
-    tx.execute("DELETE FROM memories WHERE id = ?1", params![full_id])?;
-    tx.commit()?;
+    conn.execute("DELETE FROM memories WHERE id = ?1", params![full_id])?;
     Ok(Some(text))
 }
 
@@ -1361,21 +1335,15 @@ pub fn cli_stats(cfg: &Config, user: Option<&str>) -> Result<MemoryStats> {
     })
 }
 
-/// CLI `memory delete --all`：硬删全部记忆（彻底 `DELETE` + 级联）+ 清空 vec0，返回条数。
-/// 危险操作、不可逆，调用方（cli）负责 --yes 确认。memories 与 vec0 同一事务。
+/// CLI `memory delete --all`：硬删全部记忆（彻底 `DELETE` + 级联），返回条数。
+/// 危险操作、不可逆，调用方（cli）负责 --yes 确认。
 pub fn cli_delete_all(cfg: &Config) -> Result<usize> {
-    register_vec_extension();
-    let mut conn = Connection::open(&cfg.db_path)
+    let conn = Connection::open(&cfg.db_path)
         .with_context(|| format!("无法打开数据库 {}", cfg.db_path))?;
     conn.pragma_update(None, "busy_timeout", 5000)?;
     conn.pragma_update(None, "foreign_keys", true)?;
-    ensure_vec_table(&conn, cfg.embedding_dimensions)?;
-
-    let tx = conn.transaction()?;
-    tx.execute("DELETE FROM vec_memories", [])?;
     // WHERE 1 = ?1 恒真，既删全部又避免空参数数组的类型推断歧义。
-    let n = tx.execute("DELETE FROM memories WHERE 1 = ?1", params![1_i64])?;
-    tx.commit()?;
+    let n = conn.execute("DELETE FROM memories WHERE 1 = ?1", params![1_i64])?;
     Ok(n)
 }
 
@@ -1386,24 +1354,16 @@ mod tests {
     fn test_config(db_path: &str) -> Arc<Config> {
         let mut cfg = Config::from_env().unwrap();
         cfg.db_path = db_path.to_string();
-        // 测试向量是 4 维，vec0 表须按同一维度建。
-        cfg.embedding_dimensions = 4;
         Arc::new(cfg)
     }
 
-    fn unit(x: f32, y: f32, z: f32, w: f32) -> Vec<f32> {
-        let norm = (x * x + y * y + z * z + w * w).sqrt();
-        vec![x / norm, y / norm, z / norm, w / norm]
-    }
-
-    fn mem(user: &str, text: &str, kind: &str, embedding: Vec<f32>) -> NewMemory {
+    fn mem(user: &str, text: &str, kind: &str) -> NewMemory {
         NewMemory {
             user_id: user.into(),
             text: text.into(),
             kind: kind.into(),
             subject: "user".into(),
             entities: Vec::new(),
-            embedding,
             source: "test".into(),
         }
     }
@@ -1416,11 +1376,14 @@ mod tests {
     }
 
     #[test]
-    fn blob_roundtrip_matches_python_f16_layout() {
-        let vector = vec![0.5f32, -0.25, 1.0, 0.0];
-        let blob = vec_to_blob(&vector);
-        assert_eq!(blob.len(), 8);
-        assert_eq!(blob_to_vec(&blob), vector);
+    fn trigram_similarity_separates_near_dupes_from_distinct_text() {
+        // 只差一个句号 → 标点被滤掉，完全相同；换个说法讲同一件事 → 远低于合并阈值
+        //（这类语义重复交给记忆模型 reconcile，不归近似去重管）。
+        assert_eq!(trigram_similarity("用户喜欢喝美式咖啡", "用户喜欢喝美式咖啡。"), 1.0);
+        assert!(trigram_similarity("用户养了一只叫年糕的猫", "用户家里有只小猫咪") < 0.5);
+        // 否定与肯定字面高度重合，但阈值 0.9 仍能分开，不会被误合并。
+        assert!(trigram_similarity("用户喜欢香菜", "用户不喜欢香菜") < 0.9);
+        assert_eq!(trigram_similarity("猫", "猫"), 1.0);
     }
 
     #[test]
@@ -1451,54 +1414,81 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_search_and_isolation() {
+    async fn pool_is_recency_ordered_and_user_isolated() {
         let (_dir, store) = open_store();
         let cat = store
-            .create_memory(mem("u1", "用户养了一只叫年糕的猫", "fact", unit(1.0, 0.0, 0.0, 0.0)))
+            .create_memory(mem("u1", "用户养了一只叫年糕的猫", "fact"))
             .await
             .unwrap();
         assert_eq!(cat.deduplicated, Some(false));
-        store
-            .create_memory(mem("u1", "用户最近在追一部剧", "event", unit(0.0, 1.0, 0.0, 0.0)))
+        let show = store
+            .create_memory(mem("u1", "用户最近在追一部剧", "event"))
             .await
             .unwrap();
-        let results = store
-            .search_memories("u1".into(), unit(1.0, 0.2, 0.0, 0.0), None, None)
+
+        // 候选池按 last_seen_at 倒序：后写入的排前面。
+        let pool = store.memory_pool("u1".into(), 10).await.unwrap();
+        assert_eq!(
+            pool.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(),
+            vec!["用户最近在追一部剧", "用户养了一只叫年糕的猫"]
+        );
+        // limit 截断保留最近的那部分。
+        let capped = store.memory_pool("u1".into(), 1).await.unwrap();
+        assert_eq!(capped.len(), 1);
+        assert_eq!(capped[0].text, "用户最近在追一部剧");
+        // 用户隔离。
+        assert!(store.memory_pool("u2".into(), 10).await.unwrap().is_empty());
+
+        // 按 id 取回：顺序跟随传入的 id，跨用户取不到。
+        let views = store
+            .memories_by_ids("u1".into(), vec![cat.id.clone(), show.id.clone()])
             .await
             .unwrap();
-        assert!(results[0].text.starts_with("用户养了一只"));
-        assert!(results[0].score.unwrap() > 0.9);
-        let other = store
-            .search_memories("u2".into(), unit(1.0, 0.0, 0.0, 0.0), None, None)
+        assert_eq!(
+            views.iter().map(|v| v.text.as_str()).collect::<Vec<_>>(),
+            vec!["用户养了一只叫年糕的猫", "用户最近在追一部剧"]
+        );
+        assert!(store
+            .memories_by_ids("u2".into(), vec![cat.id])
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn memories_by_ids_skips_unknown_ids() {
+        let (_dir, store) = open_store();
+        let kept = store.create_memory(mem("u1", "用户在学日语", "goal")).await.unwrap();
+        let views = store
+            .memories_by_ids(
+                "u1".into(),
+                vec!["不存在的-id".to_string(), kept.id.clone()],
+            )
             .await
             .unwrap();
-        assert!(other.is_empty());
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].id, kept.id);
     }
 
     #[tokio::test]
     async fn fingerprint_dedupe_merges() {
         let (_dir, store) = open_store();
-        let first = store
-            .create_memory(mem("u1", "用户在学日语", "goal", unit(0.0, 0.0, 1.0, 0.0)))
-            .await
-            .unwrap();
-        let again = store
-            .create_memory(mem("u1", "用户在学日语", "goal", unit(0.0, 0.0, 1.0, 0.0)))
-            .await
-            .unwrap();
+        let first = store.create_memory(mem("u1", "用户在学日语", "goal")).await.unwrap();
+        let again = store.create_memory(mem("u1", "用户在学日语", "goal")).await.unwrap();
         assert_eq!(again.deduplicated, Some(true));
         assert_eq!(again.id, first.id);
     }
 
     #[tokio::test]
-    async fn near_duplicate_vector_merges() {
+    async fn near_duplicate_text_merges() {
         let (_dir, store) = open_store();
         let first = store
-            .create_memory(mem("u1", "用户喜欢喝美式咖啡", "preference", unit(1.0, 0.001, 0.0, 0.0)))
+            .create_memory(mem("u1", "用户喜欢喝美式咖啡", "preference"))
             .await
             .unwrap();
+        // 只多一个句号：指纹不同，靠三元组相似度合并。
         let merged = store
-            .create_memory(mem("u1", "用户喜欢喝美式咖啡。", "preference", unit(1.0, 0.002, 0.0, 0.0)))
+            .create_memory(mem("u1", "用户喜欢喝美式咖啡。", "preference"))
             .await
             .unwrap();
         assert_eq!(merged.deduplicated, Some(true));
@@ -1510,39 +1500,54 @@ mod tests {
         // 同一件事被两次巩固标成不同 kind、措辞略有差异（指纹不同）：近似去重应仍按
         // (user, subject) 合并，不因 kind 不同而各存一条。
         let (_dir, store) = open_store();
-        let first = store
-            .create_memory(mem("u1", "用户在学日语", "goal", unit(0.0, 0.0, 1.0, 0.0)))
-            .await
-            .unwrap();
-        let merged = store
-            .create_memory(mem("u1", "用户在学日语。", "fact", unit(0.0, 0.001, 1.0, 0.0)))
-            .await
-            .unwrap();
+        let first = store.create_memory(mem("u1", "用户在学日语", "goal")).await.unwrap();
+        let merged = store.create_memory(mem("u1", "用户在学日语。", "fact")).await.unwrap();
         assert_eq!(merged.deduplicated, Some(true));
         assert_eq!(merged.id, first.id);
+    }
+
+    #[tokio::test]
+    async fn distinct_memories_are_not_merged() {
+        // 措辞不同但讲同一件事：字面相似度不够，这里应各存一条（语义合并归记忆模型管）。
+        let (_dir, store) = open_store();
+        store
+            .create_memory(mem("u1", "用户养了一只叫年糕的猫", "fact"))
+            .await
+            .unwrap();
+        let second = store
+            .create_memory(mem("u1", "用户家里有只小猫咪", "fact"))
+            .await
+            .unwrap();
+        assert_eq!(second.deduplicated, Some(false));
+        assert_eq!(store.memory_pool("u1".into(), 10).await.unwrap().len(), 2);
+        // 否定句不能被并进肯定句。
+        store.create_memory(mem("u1", "用户喜欢香菜", "preference")).await.unwrap();
+        let negated = store
+            .create_memory(mem("u1", "用户不喜欢香菜", "preference"))
+            .await
+            .unwrap();
+        assert_eq!(negated.deduplicated, Some(false));
     }
 
     #[tokio::test]
     async fn forget_supersede_and_history() {
         let (_dir, store) = open_store();
         let old = store
-            .create_memory(mem("u1", "用户在 A 公司上班", "fact", unit(1.0, 0.0, 0.0, 0.0)))
+            .create_memory(mem("u1", "用户在 A 公司上班", "fact"))
             .await
             .unwrap();
         let new = store
-            .supersede_memory(
-                old.id.clone(),
-                mem("u1", "用户跳槽到了 B 公司", "fact", unit(0.9, 0.1, 0.0, 0.0)),
-            )
+            .supersede_memory(old.id.clone(), mem("u1", "用户跳槽到了 B 公司", "fact"))
             .await
             .unwrap();
         assert_eq!(new.superseded, Some(true));
+        // 被取代的旧记忆已停用，不再进候选池。
         let texts: Vec<String> = store
-            .search_memories("u1".into(), unit(1.0, 0.0, 0.0, 0.0), None, None)
+            .memory_pool("u1".into(), 10)
             .await
             .unwrap()
             .into_iter()
-            .map(|m| m.text)
+            .map(|c| c.text)
             .collect();
         assert_eq!(texts, vec!["用户跳槽到了 B 公司"]);
         for anchor in [&old.id, &new.id] {
@@ -1560,11 +1565,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrates_legacy_embedding_to_vec0() {
+    async fn drops_legacy_vector_columns_on_open() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("legacy.db");
         let path_str = path.to_str().unwrap().to_string();
-        // 造一个"旧库"：memories 带 embedding 列 + 一条记忆，没有 vec0。
+        // 造一个「旧库」：memories 还带着 level 与 embedding 两列，以及一条记忆。
         {
             let conn = Connection::open(&path).unwrap();
             conn.execute_batch(
@@ -1585,31 +1590,29 @@ mod tests {
             conn.execute(
                 "INSERT INTO memories (id, user_id, text, kind, level, subject, embedding, \
                  fingerprint, source, created_at, last_seen_at) \
-                 VALUES ('m1', 'u1', '旧记忆', 'fact', 5, 'user', ?1, 'fp', 'test', 't', 't')",
-                params![vec_to_blob(&unit(1.0, 0.0, 0.0, 0.0))],
+                 VALUES ('m1', 'u1', '旧记忆', 'fact', 5, 'user', x'0000', 'fp', 'test', 't', 't')",
+                [],
             )
             .unwrap();
         }
-        // Store::open 触发迁移：向量回填进 vec0，embedding 列被移除。
+        // Store::open 触发迁移：两列都被移除，记忆本身完好保留。
         let store = Store::open(test_config(&path_str)).unwrap();
-        let results = store
-            .search_memories("u1".into(), unit(1.0, 0.0, 0.0, 0.0), None, None)
-            .await
-            .unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].text, "旧记忆");
-        // embedding 列应已不存在。
-        let has_col = store
-            .run(|conn, _| {
-                Ok(conn.query_row(
-                    "SELECT count(*) FROM pragma_table_info('memories') WHERE name = 'embedding'",
-                    [],
-                    |r| r.get::<_, i64>(0),
-                )?)
-            })
-            .await
-            .unwrap();
-        assert_eq!(has_col, 0);
+        let pool = store.memory_pool("u1".into(), 10).await.unwrap();
+        assert_eq!(pool.len(), 1);
+        assert_eq!(pool[0].text, "旧记忆");
+        for column in ["embedding", "level"] {
+            let has_col = store
+                .run(move |conn, _| {
+                    Ok(conn.query_row(
+                        "SELECT count(*) FROM pragma_table_info('memories') WHERE name = ?1",
+                        params![column],
+                        |r| r.get::<_, i64>(0),
+                    )?)
+                })
+                .await
+                .unwrap();
+            assert_eq!(has_col, 0, "{column} 列应已被移除");
+        }
     }
 
     #[tokio::test]

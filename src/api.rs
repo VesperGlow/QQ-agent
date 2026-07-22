@@ -97,11 +97,11 @@ async fn health_live() -> Json<Value> {
 
 async fn health(State(state): State<AppState>) -> Json<Value> {
     let database_ok = state.agent.store().ping().await;
-    let embedding_ok = state.agent.embedder().ready();
+    // 记忆检索走 MEMORY_MODEL，没有本地模型要预热，所以就绪与否只看数据库和模型配置。
     let llm_configured = !state.cfg.ai_base_url.is_empty()
         && !state.cfg.chat_model.is_empty()
         && !state.cfg.memory_model.is_empty();
-    let status = if database_ok && embedding_ok && llm_configured {
+    let status = if database_ok && llm_configured {
         "ok"
     } else {
         "degraded"
@@ -109,7 +109,6 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
     Json(json!({
         "status": status,
         "database": database_ok,
-        "embedding": embedding_ok,
         "llm_configured": llm_configured,
         "mcp_tools": state.agent_mcp_tool_count(),
         "config": state.cfg.safe_summary(),
@@ -173,9 +172,10 @@ async fn chat(
         let raw = std::mem::take(&mut body.images);
         let max_bytes = state.cfg.chat_image_max_bytes;
         let max_edge = state.cfg.chat_image_max_edge;
+        let max_pixels = state.cfg.chat_image_max_pixels;
         tokio::task::spawn_blocking(move || {
             raw.iter()
-                .map(|item| crate::image::normalize_input(item, max_bytes, max_edge))
+                .map(|item| crate::image::normalize_input(item, max_bytes, max_edge, max_pixels))
                 .collect::<Result<Vec<_>, _>>()
         })
         .await
@@ -239,7 +239,7 @@ async fn search_memories(
 ) -> Result<Json<Value>, ApiError> {
     require_api_key(&state, &headers)?;
     validate_len("q", &query.q, 1, 50_000)?;
-    // 走 agent 的两段式检索（余弦召回 + rerank 精排），与对话内检索一致。
+    // 走 agent 的记忆精选检索，与对话内检索一致。
     let items = state
         .agent
         .retrieve(&query.user_id, &query.q, Some(query.limit.clamp(1, 50)))
@@ -310,15 +310,6 @@ async fn create_memory(
 ) -> Result<Json<Value>, ApiError> {
     require_api_key(&state, &headers)?;
     validate_len("text", &body.text, 1, 50_000)?;
-    let vector = state
-        .agent
-        .embedder()
-        .embed(&[body.text.clone()], false)
-        .await
-        .map_err(ApiError::internal)?
-        .into_iter()
-        .next()
-        .ok_or_else(|| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "向量为空"))?;
     let view = state
         .agent
         .store()
@@ -332,7 +323,6 @@ async fn create_memory(
                 .into_iter()
                 .map(|e| EntityView { name: e.name, kind: e.kind })
                 .collect(),
-            embedding: vector,
             source: "manual_api".into(),
         })
         .await

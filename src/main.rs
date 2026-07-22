@@ -1,16 +1,16 @@
-//! Mneme：单进程二进制 —— HTTP API + 进程内 embedding/rerank + SQLite 长期记忆 + QQ 桥接。
+//! Mneme：单进程二进制 —— HTTP API + SQLite 长期记忆 + QQ 桥接。
+//! 记忆检索不用向量：候选池直接交给记忆模型精选（见 `agent::Agent::retrieve`），
+//! 进程内不再有任何本地模型推理。
 
 mod agent;
 mod api;
 mod cli;
 mod config;
-mod embedding;
 mod fetch;
 mod image;
 mod llm;
 mod mcp;
 mod qq;
-mod reranker;
 mod shutdown;
 mod store;
 
@@ -26,7 +26,7 @@ async fn main() -> Result<()> {
     let cfg = Arc::new(config::Config::from_env()?);
 
     // 带参数即当作一次性子命令（如 `memory list`）：直接查库并退出，不启动服务、
-    // 不初始化 embedding/QQ，也不打日志，保持输出干净。
+    // 不初始化 QQ，也不打日志，保持输出干净。
     let args: Vec<String> = std::env::args().skip(1).collect();
     if !args.is_empty() {
         return cli::run(&cfg, &args);
@@ -36,7 +36,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_new(format!(
-                "{level},hyper=warn,reqwest=warn,tungstenite=warn,ort=warn"
+                "{level},hyper=warn,reqwest=warn,tungstenite=warn"
             ))
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
@@ -47,8 +47,6 @@ async fn main() -> Result<()> {
     let pending = shutdown::Pending::default();
 
     let store = store::Store::open(cfg.clone())?;
-    let embedder = Arc::new(embedding::Embedder::new(cfg.clone())?);
-    let reranker = Arc::new(reranker::Reranker::new(cfg.clone()));
     let llm = Arc::new(llm::LlmClient::new(cfg.clone())?);
     let mut mcp = mcp::McpManager::new(cfg.clone())?;
     mcp.start().await?;
@@ -60,31 +58,11 @@ async fn main() -> Result<()> {
     let agent = agent::Agent::new(
         cfg.clone(),
         store.clone(),
-        embedder.clone(),
-        reranker.clone(),
         llm,
         Arc::new(mcp),
         fetcher,
         pending.clone(),
     );
-
-    // 预热本地 embedding（首次启动含模型下载），不阻塞服务就绪。
-    {
-        let embedder = embedder.clone();
-        tokio::spawn(async move {
-            if let Err(error) = embedder.warmup().await {
-                tracing::warn!("Embedding 预热失败：{error:#}");
-            }
-        });
-    }
-
-    // 预热重排模型（可选；下载/加载失败只告警，检索会回退到纯余弦）。
-    if reranker.enabled() {
-        let reranker = reranker.clone();
-        tokio::spawn(async move {
-            reranker.warmup().await;
-        });
-    }
 
     // HTTP API
     let state = api::AppState {

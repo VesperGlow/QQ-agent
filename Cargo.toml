@@ -4,12 +4,6 @@ version = "0.3.0"
 edition = "2021"
 rust-version = "1.85"
 
-[features]
-# onnx = 进程内 embedding 推理（ort + tokenizers）。关闭后仅支持
-# EMBEDDING_API_STYLE=openai 远程接口，用于在缺 ONNX 预编译库的平台上编译测试。
-default = ["onnx"]
-onnx = ["dep:ort", "dep:tokenizers", "dep:memmap2"]
-
 [dependencies]
 anyhow = "1"
 axum = "0.8"
@@ -17,7 +11,6 @@ base64 = "0.22"
 chrono = "0.4"
 ed25519-dalek = "3"
 futures-util = "0.3"
-half = "2"
 hex = "0.4"
 # 图片压缩：解码 jpeg/png，缩放后重编码 JPEG，把超大图压进上游 vision 接口的大小限制
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
@@ -29,8 +22,6 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 dom_smoothie = "0.18"
 htmd = "0.5"
 rusqlite = { version = "0.40", features = ["bundled"] }
-# 向量检索：进程内注册 vec0 虚拟表（KNN + 余弦），把向量搜索/近重下沉到 SQL。
-sqlite-vec = "0.1.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
@@ -39,11 +30,6 @@ tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
-
-memmap2 = { version = "0.9", optional = true }
-ort = { version = "=2.0.0-rc.12", optional = true }
-# unstable_wasm = 纯 Rust 正则引擎（fancy-regex），避免 onig 的 C 依赖
-tokenizers = { version = "0.23", default-features = false, features = ["unstable_wasm"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"

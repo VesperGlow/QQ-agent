@@ -1,5 +1,5 @@
 [Unit]
-Description=Mneme all-in-one (AI API with embedded SQLite/ONNX + QQ bridge)
+Description=Mneme all-in-one (AI API with embedded SQLite + QQ bridge)
 
 [Container]
 Image=ghcr.io/vesperglow/mneme:latest
@@ -10,16 +10,15 @@ PublishPort=127.0.0.1:9000:9000
 # 从旧的 qq-agent-* 卷迁移数据后再启用（见 README「切到 mneme」一节），
 # 否则会挂到新建的空卷、丢掉既有 memory.db。
 Volume=mneme-data:/data
-Volume=mneme-models:/models
-# embedding + reranker 两个模型各约 650MB，合计常驻约 1.3GB、稳态往 1.5GB 走；上限兜底 2GB
-#（偏紧：内存不足可 RERANK_ENABLED=false 关重排，或调大 --memory）。
-PodmanArgs=--memory=2g
+# 稳态只有几十 MB（axum + SQLite，无本地模型），但图片解码没有像素数上限，
+# 一张大图的 RgbImage 就能占几十 MB、缩放时翻倍。上限按峰值留；不用图片理解可降到 256m。
+PodmanArgs=--memory=512m
 AutoUpdate=registry
 HealthCmd=curl -fsS http://127.0.0.1:8000/health/live >/dev/null && curl -fsS http://127.0.0.1:9000/healthz >/dev/null
 HealthInterval=15s
 HealthRetries=5
-# 首次启动要下载 embedding + reranker 两个模型（各约 640MB），给足冷启动时间。
-HealthStartPeriod=420s
+# 无模型下载，启动就是开监听。
+HealthStartPeriod=30s
 HealthTimeout=5s
 HealthOnFailure=kill
 Notify=healthy
@@ -27,7 +26,7 @@ Notify=healthy
 [Service]
 Restart=always
 RestartSec=5s
-TimeoutStartSec=600
+TimeoutStartSec=120
 TimeoutStopSec=30
 
 [Install]

@@ -88,12 +88,6 @@ pub struct McpServer {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EmbeddingStyle {
-    Local,
-    OpenAi,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QqEventMode {
     Webhook,
     WebSocket,
@@ -142,24 +136,22 @@ pub struct Config {
 
     pub db_path: String,
 
-    pub embedding_api_style: EmbeddingStyle,
-    pub embedding_model: String,
-    pub embedding_base_url: String,
-    pub embedding_api_key: String,
-    pub embedding_dimensions: usize,
-    pub embedding_context_size: usize,
-    pub embedding_query_instruction: String,
-    pub embedding_timeout_seconds: f64,
-    pub embedding_threads: usize,
-    pub embedding_output_min: f32,
-    pub embedding_output_max: f32,
-    pub hf_token: String,
-
-    /// 二段精排前，一段余弦召回返回给上层的最终条数上限。
+    /// 检索最终注入上下文的记忆条数上限（精选后截断到这个数）。
     pub memory_search_limit: usize,
-    pub memory_min_score: f32,
     pub memory_history_messages: i64,
+    /// 近似去重阈值：新记忆与同 user+subject 的已有记忆的字符三元组 Jaccard 相似度
+    /// ≥ 此值即合并。只兜「改了个标点/语气词」这类字面近重，语义重复由记忆模型 reconcile。
     pub memory_duplicate_threshold: f32,
+
+    /// 记忆精选（检索）：候选池上限。按 last_seen_at 倒序取这么多条活跃记忆交给记忆模型挑。
+    /// 调大提升召回上限（更老的记忆也进得来），代价是每次精选的输入 token 线性增长。
+    pub memory_select_pool_max: usize,
+    /// 候选清单里每条记忆的截断长度（字符）。挑选只需看个大意，超长记忆没必要整条喂。
+    pub memory_select_text_max_chars: usize,
+    /// 精选时查询文本的截断长度（字符）。
+    pub memory_select_query_max_chars: usize,
+    /// 精选调用的输出上限。只输出一个编号数组，几百 token 绰绰有余。
+    pub memory_select_max_output_tokens: u32,
     /// 自动记忆巩固：短期窗口滑出的旧消息批量交给记忆模型抽取/reconcile 成长期记忆。
     /// 取代了旧的「每轮筛选用户单句」，改到压缩时对整批做，上下文更完整。
     pub memory_consolidate_enabled: bool,
@@ -173,19 +165,6 @@ pub struct Config {
     /// flush 扫描周期（秒）。
     pub memory_flush_interval_seconds: u64,
 
-    /// 重排（rerank）：本地 ONNX 交叉编码器给 (query, 候选) 联合打分做二段精排。
-    /// 关闭、模型加载失败或推理出错时，自动回退到一段余弦顺序，服务不受影响。
-    pub rerank_enabled: bool,
-    pub rerank_model: String,
-    /// 从仓库多个 onnx 变体里挑一个的偏好子串（如 "quantized"/"q4"/"fp16"）；
-    /// onnx-community 这类仓库把多份量化权重放在 onnx/ 子目录，必须挑一个而不是全下。
-    pub rerank_onnx_file: String,
-    /// 一段余弦召回的候选宽度：喂给重排器的最多条数（再由重排精排到 memory_search_limit）。
-    pub rerank_candidates: usize,
-    pub rerank_context_size: usize,
-    pub rerank_threads: usize,
-    pub rerank_instruction: String,
-
     pub conversation_summary_enabled: bool,
     pub conversation_summary_batch: usize,
     pub conversation_summary_max_chars: usize,
@@ -197,6 +176,10 @@ pub struct Config {
     pub chat_image_max_bytes: usize,
     /// 从 QQ CDN 下载原图的大小上限（压缩前），防滥用兜底。
     pub chat_image_fetch_max_bytes: usize,
+    /// **解码前**的像素数闸门，超过就直接拒绝。这是容器内存峰值的实际决定因素：
+    /// `chat_image_max_edge` 管的是输出尺寸，缩放却在解码之后发生，所以不设这道闸，
+    /// 一张超大原图会先解成几百 MB 的缓冲。按最坏路径约 12 字节/像素估内存。
+    pub chat_image_max_pixels: u32,
     /// 图片长边像素上限，超过则缩放；视觉模型内部分辨率有限，缩了还省 token。
     pub chat_image_max_edge: u32,
 
@@ -269,11 +252,6 @@ impl Config {
             _ => ai_thinking_map.clone(),
         };
 
-        let embedding_api_style = match env_string("EMBEDDING_API_STYLE", "local").as_str() {
-            "local" => EmbeddingStyle::Local,
-            "openai" => EmbeddingStyle::OpenAi,
-            other => bail!("EMBEDDING_API_STYLE 只能是 local 或 openai，当前是 {other}"),
-        };
         let qq_event_mode = match env_string("QQ_EVENT_MODE", "webhook").to_lowercase().as_str() {
             "webhook" => QqEventMode::Webhook,
             "websocket" => QqEventMode::WebSocket,
@@ -320,31 +298,31 @@ impl Config {
 
             db_path: env_string("DB_PATH", "/data/memory.db"),
 
-            embedding_api_style,
-            embedding_model: env_string(
-                "EMBEDDING_MODEL",
-                "electroglyph/Qwen3-Embedding-0.6B-onnx-uint8",
-            ),
-            embedding_base_url: env_string("EMBEDDING_BASE_URL", "")
-                .trim_end_matches('/')
-                .to_string(),
-            embedding_api_key: env_string("EMBEDDING_API_KEY", ""),
-            embedding_dimensions: clamp(env_parse("EMBEDDING_DIMENSIONS", 1024), 32, 4096),
-            embedding_context_size: clamp(env_parse("EMBEDDING_CONTEXT_SIZE", 512), 64, 32768),
-            embedding_query_instruction: env_string(
-                "EMBEDDING_QUERY_INSTRUCTION",
-                "Given a user's message, retrieve memories that are useful for personalizing the response",
-            ),
-            embedding_timeout_seconds: env_parse("EMBEDDING_TIMEOUT_SECONDS", 180.0),
-            embedding_threads: clamp(env_parse("EMBEDDING_THREADS", 4), 1, 32),
-            embedding_output_min: env_parse("EMBEDDING_OUTPUT_MIN", -0.3009),
-            embedding_output_max: env_parse("EMBEDDING_OUTPUT_MAX", 0.3952),
-            hf_token: env_string("HF_TOKEN", ""),
-
             memory_search_limit: clamp(env_parse("MEMORY_SEARCH_LIMIT", 8), 1, 50),
-            memory_min_score: env_parse("MEMORY_MIN_SCORE", 0.30),
             memory_history_messages: clamp(env_parse("MEMORY_HISTORY_MESSAGES", 16), 0, 100),
-            memory_duplicate_threshold: env_parse("MEMORY_DUPLICATE_THRESHOLD", 0.995),
+            // 0.9 ≈「只差标点或一两个语气词」。标点在比较前已被滤掉，所以纯加句号的改写是
+            // 1.0；而「喜欢 X」与「不喜欢 X」只有 0.3 左右，不会被误合并。
+            memory_duplicate_threshold: clamp(
+                env_parse("MEMORY_DUPLICATE_THRESHOLD", 0.9),
+                0.5,
+                1.0,
+            ),
+            memory_select_pool_max: clamp(env_parse("MEMORY_SELECT_POOL_MAX", 400), 10, 5000),
+            memory_select_text_max_chars: clamp(
+                env_parse("MEMORY_SELECT_TEXT_MAX_CHARS", 200),
+                20,
+                2000,
+            ),
+            memory_select_query_max_chars: clamp(
+                env_parse("MEMORY_SELECT_QUERY_MAX_CHARS", 2000),
+                100,
+                20000,
+            ),
+            memory_select_max_output_tokens: clamp(
+                env_parse("MEMORY_SELECT_MAX_OUTPUT_TOKENS", 300),
+                50,
+                4000,
+            ),
             memory_consolidate_enabled: env_bool("MEMORY_CONSOLIDATE_ENABLED", true),
             memory_consolidate_batch: clamp(env_parse("MEMORY_CONSOLIDATE_BATCH", 6), 2, 100),
             memory_flush_enabled: env_bool("MEMORY_FLUSH_ENABLED", true),
@@ -353,17 +331,6 @@ impl Config {
                 env_parse("MEMORY_FLUSH_INTERVAL_SECONDS", 300),
                 30,
                 3600,
-            ),
-
-            rerank_enabled: env_bool("RERANK_ENABLED", true),
-            rerank_model: env_string("RERANK_MODEL", "onnx-community/Qwen3-Reranker-0.6B-ONNX"),
-            rerank_onnx_file: env_string("RERANK_ONNX_FILE", "quantized"),
-            rerank_candidates: clamp(env_parse("RERANK_CANDIDATES", 50), 1, 500),
-            rerank_context_size: clamp(env_parse("RERANK_CONTEXT_SIZE", 512), 64, 32768),
-            rerank_threads: clamp(env_parse("RERANK_THREADS", 4), 1, 32),
-            rerank_instruction: env_string(
-                "RERANK_INSTRUCTION",
-                "Given the user's message, judge whether the memory is useful for personalizing the reply",
             ),
 
             conversation_summary_enabled: env_bool("CONVERSATION_SUMMARY_ENABLED", true),
@@ -383,6 +350,14 @@ impl Config {
                 104_857_600,
             ),
             chat_image_max_edge: clamp(env_parse("CHAT_IMAGE_MAX_EDGE", 2048), 512, 8192),
+            // 16MP 覆盖 4K 截图与主流手机照片（12MP），按 12 字节/像素约 192MB 解码峰值，
+            // 落在默认 mem_limit=512m 内；把 mem_limit 压到 256m 时要一并调到 8MP 左右。
+            // 上界 200MP 只防配置写错，真按它配需要自行放宽 mem_limit。
+            chat_image_max_pixels: clamp(
+                env_parse("CHAT_IMAGE_MAX_PIXELS", 16_000_000),
+                1_000_000,
+                200_000_000,
+            ),
 
             mood_tracking_enabled: env_bool("MOOD_TRACKING_ENABLED", true),
             mood_trend_days: clamp(env_parse("MOOD_TREND_DAYS", 7), 1, 90),
@@ -418,13 +393,9 @@ impl Config {
             chat_model: &'a str,
             chat_think: &'a str,
             chat_thinking_levels: Vec<&'a str>,
-            embedding_api_style: &'a str,
-            embedding_model: &'a str,
-            embedding_dimensions: usize,
-            embedding_context_size: usize,
             db_path: &'a str,
-            rerank_enabled: bool,
-            rerank_model: &'a str,
+            memory_search_limit: usize,
+            memory_select_pool_max: usize,
             mcp_servers: Vec<&'a str>,
         }
         serde_json::to_value(Summary {
@@ -434,16 +405,9 @@ impl Config {
             chat_model: &self.chat_model,
             chat_think: self.chat_think.key(),
             chat_thinking_levels: self.ai_thinking_map.keys().map(String::as_str).collect(),
-            embedding_api_style: match self.embedding_api_style {
-                EmbeddingStyle::Local => "local",
-                EmbeddingStyle::OpenAi => "openai",
-            },
-            embedding_model: &self.embedding_model,
-            embedding_dimensions: self.embedding_dimensions,
-            embedding_context_size: self.embedding_context_size,
             db_path: &self.db_path,
-            rerank_enabled: self.rerank_enabled,
-            rerank_model: &self.rerank_model,
+            memory_search_limit: self.memory_search_limit,
+            memory_select_pool_max: self.memory_select_pool_max,
             mcp_servers: self.mcp_servers.iter().map(|s| s.name.as_str()).collect(),
         })
         .expect("safe summary 序列化不应失败")
